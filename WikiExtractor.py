@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 #
 # =============================================================================
-#  Version: 2.3 (March 31, 2013)
+#  Version: 2.4 (April 2, 2013)
 #  Author: Giuseppe Attardi (attardi@di.unipi.it), University of Pisa
 #	   Antonio Fuschetto (fuschett@di.unipi.it), University of Pisa
 #
@@ -64,7 +64,8 @@ from htmlentitydefs import name2codepoint
 
 ### PARAMS ####################################################################
 
-prefix = 'http://it.wikipedia.org/wiki/'
+# This is obtained from the dump itself
+prefix = None
 
 ##
 # Whether to preseve links in output
@@ -129,12 +130,6 @@ def WikiDocument(out, id, title, text):
 
 def get_url(id, prefix):
     return "%s?curid=%s" % (prefix, id)
-
-# This version tries to guess the URL from the title
-# def guess_url(title, prefix):
-#     title = urllib.quote(title.replace(' ', '_').encode('utf-8'))
-#     title = title.replace('%28', '(').replace('%29', ')')
-#     return prefix + title.capitalize()
 
 #------------------------------------------------------------------------------
 
@@ -216,20 +211,20 @@ comment = re.compile(r'<!--.*?-->', re.DOTALL)
 # Match elements to ignore
 discard_element_patterns = []
 for tag in discardElements:
-    pattern = re.compile(r'<\s*%s\b[^>]*?>.*?<\s*/\s*%s>' % (tag, tag), re.DOTALL | re.IGNORECASE)
+    pattern = re.compile(r'<\s*%s\b[^>]*>.*?<\s*/\s*%s>' % (tag, tag), re.DOTALL | re.IGNORECASE)
     discard_element_patterns.append(pattern)
 
 # Match ignored tags
 ignored_tag_patterns = []
 for tag in ignoredTags:
-    left = re.compile(r'<\s*%s\b[^>]*?>' % tag, re.IGNORECASE)
+    left = re.compile(r'<\s*%s\b[^>]*>' % tag, re.IGNORECASE)
     right = re.compile(r'<\s*/\s*%s>' % tag, re.IGNORECASE)
     ignored_tag_patterns.append((left, right))
 
 # Match selfClosing HTML tags
 selfClosing_tag_patterns = []
 for tag in selfClosingTags:
-    pattern = re.compile(r'<\s*%s\b[^/]*?/\s*>' % tag, re.DOTALL | re.IGNORECASE)
+    pattern = re.compile(r'<\s*%s\b[^/]*/\s*>' % tag, re.DOTALL | re.IGNORECASE)
     selfClosing_tag_patterns.append(pattern)
 
 # Match HTML placeholder tags
@@ -446,7 +441,7 @@ def compact(text):
     page = []                   # list of paragraph
     headers = {}                # Headers for unfilled sections
     emptySection = False        # empty sections are discarded
-    inList = False              # wheter opened <UL>
+    inList = False              # whether opened <UL>
 
     for line in text.split('\n'):
 
@@ -555,6 +550,7 @@ class OutputSplitter:
 tagRE = re.compile(r'(.*?)<(/?\w+)[^>]*>(?:([^<]*)(<.*?>)?)?')
 
 def process_data(input, output):
+    global prefix
 
     page = []
     id = None
@@ -597,6 +593,11 @@ def process_data(input, output):
                 WikiDocument(output, id, title, ''.join(page))
             id = None
             page = []
+        elif tag == 'base':
+            # discover prefix from the xml dump file
+            # /mediawiki/siteinfo/base
+            base = m.group(3)
+            prefix = base[:base.rfind("/")]
 
 ### CL INTERFACE ############################################################
 
