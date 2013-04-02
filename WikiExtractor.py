@@ -1,10 +1,17 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-
+#
 # =============================================================================
-#  Version: 2.1 (June 28, 2012)
+#  Version: 2.3 (March 31, 2013)
 #  Author: Giuseppe Attardi (attardi@di.unipi.it), University of Pisa
 #	   Antonio Fuschetto (fuschett@di.unipi.it), University of Pisa
+#
+#  Contributors:
+#	Leonardo Souza (lsouza@amtera.com.br)
+#	Juan Manuel Caicedo (juan@cavorite.com)
+#	Humberto Pereira (begini@gmail.com)
+#	Siegfried-A. Gevatter (siegfried@gevatter.com), 2013
+#
 # =============================================================================
 #  Copyright (c) 2009. Giuseppe Attardi (attardi@di.unipi.it).
 # =============================================================================
@@ -38,11 +45,12 @@ Options:
   -c, --compress        : compress output files using bzip
   -b, --bytes= n[KM]    : put specified bytes per output file (default 500K)
   -B, --base= URL       : base URL for the Wikipedia pages
+  -l, --link            : preserve links
+  -n NS, --ns NS        : accepted namespaces (separated by commas)
   -o, --output= dir     : place output files in specified directory (default
                           current)
-  -l, --link            : preserve links
   -s, --sections	: preserve sections
-  --help                : display this help and exit
+  -h, --help            : display this help and exit
 """
 
 import sys
@@ -69,10 +77,10 @@ keepLinks = False
 keepSections = False
 
 ##
-# Recognize onlyy these namespaces
+# Recognize only these namespaces
+# w: Internal links to the Wikipedia
 #
-acceptedNamespaces = set([
-])
+acceptedNamespaces = set(['w'])
 
 ##
 # Drop these elements from article text
@@ -100,13 +108,14 @@ discardElements = set([
 #=========================================================================== 
 
 # Program version
-version = '2.1'
+version = '2.3'
+
 
 ##### Main function ###########################################################
 
 def WikiDocument(out, id, title, text):
-    url = guess_url(title, prefix)
-    header = '<doc id="%s" url="%s" title="%s">' % (id, url, title)
+    url = get_url(id, prefix)
+    header = '<doc id="%s" url="%s" title="%s">\n' % (id, url, title)
     # Separate header from text with a newline.
     header += title + '\n'
     header = header.encode('utf-8')
@@ -118,10 +127,14 @@ def WikiDocument(out, id, title, text):
         print >> out, line.encode('utf-8')
     print >> out, footer
 
-def guess_url(title, prefix):
-    title = urllib.quote(title.replace(' ', '_').encode('utf-8'))
-    title = title.replace('%28', '(').replace('%29', ')')
-    return prefix + title.capitalize()
+def get_url(id, prefix):
+    return "%s?curid=%s" % (prefix, id)
+
+# This version tries to guess the URL from the title
+# def guess_url(title, prefix):
+#     title = urllib.quote(title.replace(' ', '_').encode('utf-8'))
+#     title = title.replace('%28', '(').replace('%29', ')')
+#     return prefix + title.capitalize()
 
 #------------------------------------------------------------------------------
 
@@ -203,26 +216,26 @@ comment = re.compile(r'<!--.*?-->', re.DOTALL)
 # Match elements to ignore
 discard_element_patterns = []
 for tag in discardElements:
-    pattern = re.compile(r'<%s[^>]*>.*?</%s>' % (tag, tag), re.DOTALL | re.IGNORECASE)
+    pattern = re.compile(r'<\s*%s\b[^>]*?>.*?<\s*/\s*%s>' % (tag, tag), re.DOTALL | re.IGNORECASE)
     discard_element_patterns.append(pattern)
 
 # Match ignored tags
 ignored_tag_patterns = []
 for tag in ignoredTags:
-    left = re.compile(r'<%s[^/]*>' % tag, re.IGNORECASE)
-    right = re.compile(r'</%s>' % tag, re.IGNORECASE)
+    left = re.compile(r'<\s*%s\b[^>]*?>' % tag, re.IGNORECASE)
+    right = re.compile(r'<\s*/\s*%s>' % tag, re.IGNORECASE)
     ignored_tag_patterns.append((left, right))
 
 # Match selfClosing HTML tags
 selfClosing_tag_patterns = []
 for tag in selfClosingTags:
-    pattern = re.compile(r'<%s[^/]*/\s*>' % tag, re.DOTALL | re.IGNORECASE)
+    pattern = re.compile(r'<\s*%s\b[^/]*?/\s*>' % tag, re.DOTALL | re.IGNORECASE)
     selfClosing_tag_patterns.append(pattern)
 
 # Match HTML placeholder tags
 placeholder_tag_patterns = []
 for tag, repl in placeholder_tags.items():
-    pattern = re.compile(r'<\s*%s(\s*| [^/]+?)>.*?<\s*/\s*%s\s*>' % (tag, tag), re.DOTALL | re.IGNORECASE)
+    pattern = re.compile(r'<\s*%s(\s*| [^>]+?)>.*?<\s*/\s*%s\s*>' % (tag, tag), re.DOTALL | re.IGNORECASE)
     placeholder_tag_patterns.append((pattern, repl))
 
 # Match preformatted lines
@@ -350,9 +363,6 @@ def clean(text):
     # Drop tables
     text = dropNested(text, r'{\|', r'\|}')
 
-    # Drop preformatted
-    text = preformatted.sub('', text)
-
     # Expand links
     text = wikiLink.sub(make_anchor_tag, text)
     # Drop all remaining ones
@@ -412,6 +422,12 @@ def clean(text):
             index += 1
 
     text = text.replace('<<', u'«').replace('>>', u'»')
+
+    #############################################
+
+    # Drop preformatted
+    # This can't be done before since it may remove tags
+    text = preformatted.sub('', text)
 
     # Cleanup text
     text = text.replace('\t', ' ')
@@ -536,7 +552,7 @@ class OutputSplitter:
 
 ### READER ###################################################################
 
-tagRE = re.compile(r'(.*?)<(/?\w+)[^>]*>(?:([^<]*)(<.*>)?)?')
+tagRE = re.compile(r'(.*?)<(/?\w+)[^>]*>(?:([^<]*)(<.*?>)?)?')
 
 def process_data(input, output):
 
@@ -546,11 +562,11 @@ def process_data(input, output):
     redirect = False
     for line in input:
         line = line.decode('utf-8')
-        m = tagRE.search(line)
-        if m:
-            tag = m.group(2)
-        else:
-            tag = ''
+        tag = ''
+        if '<' in line:
+            m = tagRE.search(line)
+            if m:
+                tag = m.group(2)
         if tag == 'page':
             page = []
             redirect = False
@@ -595,12 +611,12 @@ def show_usage(script_name):
 minFileSize = 200 * 1024
 
 def main():
-    global keepLinks, keepSections, prefix
+    global keepLinks, keepSections, prefix, acceptedNamespaces
     script_name = os.path.basename(sys.argv[0])
 
     try:
-        long_opts = ['help', 'compress', 'bytes=', 'basename=','links', 'sections', 'output=', 'version']
-        opts, args = getopt.gnu_getopt(sys.argv[1:], 'cb:lo:B:sv', long_opts)
+        long_opts = ['help', 'compress', 'bytes=', 'basename=', 'links', 'ns=', 'sections', 'output=', 'version']
+        opts, args = getopt.gnu_getopt(sys.argv[1:], 'cb:hln:o:B:sv', long_opts)
     except getopt.GetoptError:
         show_usage(script_name)
         sys.exit(1)
@@ -610,7 +626,7 @@ def main():
     output_dir = '.'
 
     for opt, arg in opts:
-        if opt == '--help':
+        if opt in ('-h', '--help'):
             show_help()
             sys.exit()
         elif opt in ('-c', '--compress'):
@@ -634,6 +650,8 @@ def main():
                 print >> sys.stderr, \
                 '%s: %s: Insufficient or invalid size' % (script_name, arg)
                 sys.exit(2)
+        elif opt in ('-n', '--ns'):
+                acceptedNamespaces = set(arg.split(','))
         elif opt in ('-o', '--output'):
                 output_dir = arg
         elif opt in ('-v', '--version'):
@@ -644,7 +662,7 @@ def main():
         show_usage(script_name)
         sys.exit(4)
 
-    if not os.path.isdir(arg):
+    if not os.path.isdir(output_dir):
         try:
             os.makedirs(output_dir)
         except:
