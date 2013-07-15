@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 #
 # =============================================================================
-#  Version: 2.4 (April 2, 2013)
+#  Version: 2.5 (May 9, 2013)
 #  Author: Giuseppe Attardi (attardi@di.unipi.it), University of Pisa
 #	   Antonio Fuschetto (fuschett@di.unipi.it), University of Pisa
 #
@@ -10,7 +10,8 @@
 #	Leonardo Souza (lsouza@amtera.com.br)
 #	Juan Manuel Caicedo (juan@cavorite.com)
 #	Humberto Pereira (begini@gmail.com)
-#	Siegfried-A. Gevatter (siegfried@gevatter.com), 2013
+#	Siegfried-A. Gevatter (siegfried@gevatter.com)
+#	Pedro Assis (pedroh2306@gmail.com)
 #
 # =============================================================================
 #  Copyright (c) 2009. Giuseppe Attardi (attardi@di.unipi.it).
@@ -109,8 +110,7 @@ discardElements = set([
 #=========================================================================== 
 
 # Program version
-version = '2.3'
-
+version = '2.5'
 
 ##### Main function ###########################################################
 
@@ -133,14 +133,15 @@ def get_url(id, prefix):
 
 #------------------------------------------------------------------------------
 
-selfClosingTags = set([ 'br', 'hr', 'nobr', 'ref', 'references' ])
+selfClosingTags = [ 'br', 'hr', 'nobr', 'ref', 'references' ]
 
-ignoredTags = set([
-        'a', 'b', 'big', 'blockquote', 'center', 'cite', 'div', 'em',
+# handle 'a' separetely, depending on keepLinks
+ignoredTags = [
+        'b', 'big', 'blockquote', 'center', 'cite', 'div', 'em',
         'font', 'h1', 'h2', 'h3', 'h4', 'hiero', 'i', 'kbd', 'nowiki',
         'p', 'plaintext', 's', 'small', 'span', 'strike', 'strong',
         'sub', 'sup', 'tt', 'u', 'var',
-])
+]
 
 placeholder_tags = {'math':'formula', 'code':'codice'}
 
@@ -216,10 +217,13 @@ for tag in discardElements:
 
 # Match ignored tags
 ignored_tag_patterns = []
-for tag in ignoredTags:
+def ignoreTag(tag):
     left = re.compile(r'<\s*%s\b[^>]*>' % tag, re.IGNORECASE)
     right = re.compile(r'<\s*/\s*%s>' % tag, re.IGNORECASE)
     ignored_tag_patterns.append((left, right))
+
+for tag in ignoredTags:
+    ignoreTag(tag)
 
 # Match selfClosing HTML tags
 selfClosing_tag_patterns = []
@@ -416,7 +420,7 @@ def clean(text):
             text = text.replace(match.group(), '%s_%d' % (placeholder, index))
             index += 1
 
-    text = text.replace('<<', u'«').replace('>>', u'»')
+    text = text.replace('<<', u'Â«').replace('>>', u'Â»')
 
     #############################################
 
@@ -428,8 +432,8 @@ def clean(text):
     text = text.replace('\t', ' ')
     text = spaces.sub(' ', text)
     text = dots.sub('...', text)
-    text = re.sub(u' (,:\.\)\]»)', r'\1', text)
-    text = re.sub(u'(\[\(«) ', r'\1', text)
+    text = re.sub(u' (,:\.\)\]Â»)', r'\1', text)
+    text = re.sub(u'(\[\(Â«) ', r'\1', text)
     text = re.sub(r'\n\W+?\n', '\n', text) # lines with only punctuations
     text = text.replace(',,', ',').replace(',.', '.')
     return text
@@ -471,7 +475,7 @@ def compact(text):
                     title += '.'
                 page.append(title)
         # handle lists
-        elif line[-1] == ':' or line[0] in '*#:;':
+        elif line[0] in '*#:;':
             if keepSections:
                 page.append("<li>%s</li>" % line[1:])
             else:
@@ -669,6 +673,9 @@ def main():
         except:
             print >> sys.stderr, 'Could not create: ', output_dir
             return
+
+    if not keepLinks:
+        ignoreTag('a')
 
     output_splitter = OutputSplitter(compress, file_size, output_dir)
     process_data(sys.stdin, output_splitter)
