@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 #
 # =============================================================================
-#  Version: 2.5 (May 9, 2013)
+#  Version: 2.6 (Oct 14, 2013)
 #  Author: Giuseppe Attardi (attardi@di.unipi.it), University of Pisa
 #	   Antonio Fuschetto (fuschett@di.unipi.it), University of Pisa
 #
@@ -81,8 +81,10 @@ keepSections = False
 ##
 # Recognize only these namespaces
 # w: Internal links to the Wikipedia
+# wiktionary: Wiki dictionry
+# wikt: shortcut for Wikctionry
 #
-acceptedNamespaces = set(['w'])
+acceptedNamespaces = set(['w', 'wiktionary', 'wikt'])
 
 ##
 # Drop these elements from article text
