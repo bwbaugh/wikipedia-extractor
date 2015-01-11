@@ -137,7 +137,7 @@ def get_url(id, prefix):
 
 selfClosingTags = [ 'br', 'hr', 'nobr', 'ref', 'references' ]
 
-# handle 'a' separetely, depending on keepLinks
+# handle 'a' separately, depending on keepLinks
 ignoredTags = [
         'b', 'big', 'blockquote', 'center', 'cite', 'div', 'em',
         'font', 'h1', 'h2', 'h3', 'h4', 'hiero', 'i', 'kbd', 'nowiki',
@@ -147,9 +147,8 @@ ignoredTags = [
 
 placeholder_tags = {'math':'formula', 'code':'codice'}
 
-##
-# Normalize title
 def normalizeTitle(title):
+  """Normalize title"""
   # remove leading whitespace and underscores
   title = title.strip(' _')
   # replace sequences of whitespace and underscore chars with a single space
