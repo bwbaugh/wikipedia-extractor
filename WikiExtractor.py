@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 #
 # =============================================================================
-#  Version: 2.8 (Jan 10, 2015)
+#  Version: 2.32 (Apr 26, 2015)
 #  Author: Giuseppe Attardi (attardi@di.unipi.it), University of Pisa
-#	   Antonio Fuschetto (fuschett@di.unipi.it), University of Pisa
 #
 #  Contributors:
+#	Antonio Fuschetto (fuschett@aol.com)
 #	Leonardo Souza (lsouza@amtera.com.br)
 #	Juan Manuel Caicedo (juan@cavorite.com)
 #	Humberto Pereira (begini@gmail.com)
@@ -16,7 +16,7 @@
 #	Radics Geza (radicsge@gmail.com)
 #
 # =============================================================================
-#  Copyright (c) 2009. Giuseppe Attardi (attardi@di.unipi.it).
+#  Copyright (c) 2009-2015. Giuseppe Attardi (attardi@di.unipi.it).
 # =============================================================================
 #  This file is part of Tanl.
 #
@@ -34,48 +34,40 @@
 # =============================================================================
 
 """Wikipedia Extractor:
-Extracts and cleans text from Wikipedia database dump and stores output in a
+Extracts and cleans text from a Wikipedia database dump and stores output in a
 number of files of similar size in a given directory.
-Each file contains several documents in the format:
+Each file will contain several documents in the format:
 
 	<doc id="" url="" title="">
         ...
         </doc>
 
 This version performs template expansion by preprocesssng the whole dump and
-extracting template definitions.
+collecting template definitions.
 """
 
-import sys, os.path
-import re, random
-import argparse
-from itertools import izip
-import logging, traceback
+import sys, os.path, time
+import re                       # TODO use regex when it will be standard
+import argparse, random
+from itertools import izip,  izip_longest
+import logging
 import urllib
-import bz2, gzip
+import bz2
 import codecs
 from htmlentitydefs import name2codepoint
 import Queue, threading, multiprocessing
 
-### PARAMS ####################################################################
+#===========================================================================
 
-# This is obtained from <siteinfo>
-prefix = None
+# Program version
+version = '2.32'
+
+### PARAMS ####################################################################
 
 ##
 # Defined in <siteinfo>
 # We include as default Template, when loading external template file.
 knownNamespaces = set(['Template'])
-
-##
-# Whether to preserve links in output
-#
-keepLinks = False
-
-##
-# Whether to transform sections into HTML
-#
-keepSections = False
 
 ##
 # The namespace used for template definitions
@@ -87,70 +79,71 @@ templateNamespace = 'Template'
 # wiktionary: Wiki dictionary
 # wikt: shortcut for Wiktionary
 #
-acceptedNamespaces = set(['w', 'wiktionary', 'wikt'])
+acceptedNamespaces = ['w', 'wiktionary', 'wikt']
 
 ##
 # Drop these elements from article text
 #
-discardElements = set([
+discardElements = [
         'gallery', 'timeline', 'noinclude', 'pre',
-        'table', 'tr', 'td', 'th', 'caption',
+        'table', 'tr', 'td', 'th', 'caption', 'div',
         'form', 'input', 'select', 'option', 'textarea',
         'ul', 'li', 'ol', 'dl', 'dt', 'dd', 'menu', 'dir',
-        'ref', 'references', 'img', 'imagemap', 'source'
-        ])
+        'ref', 'references', 'img', 'imagemap', 'source', 'small'
+        ]
+
+# This is obtained from <siteinfo>
+urlbase = None
+
+def get_url(id):
+    global urlbase
+    return "%s?curid=%s" % (urlbase, id)
 
 #=========================================================================
 #
 # MediaWiki Markup Grammar
- 
-# Template = "{{" [ "msg:" | "msgnw:" ] PageName { "|" [ ParameterName "=" AnyText | AnyText ] } "}}" ;
-# Extension = "<" ? extension ? ">" AnyText "</" ? extension ? ">" ;
-# NoWiki = "<nowiki />" | "<nowiki>" ( InlineText | BlockText ) "</nowiki>" ;
-# Parameter = "{{{" ParameterName { Parameter } [ "|" { AnyText | Parameter } ] "}}}" ;
-# Comment = "<!--" InlineText "-->" | "<!--" BlockText "//-->" ;
-#
-# ParameterName = ? uppercase, lowercase, numbers, no spaces, some special chars ? ;
-#
-#=========================================================================== 
+# https://www.mediawiki.org/wiki/Preprocessor_ABNF
 
-# Program version
-version = '2.8'
+# xml-char = %x9 / %xA / %xD / %x20-D7FF / %xE000-FFFD / %x10000-10FFFF
+# sptab = SP / HTAB
 
-##### Main function ###########################################################
+# ; everything except ">" (%x3E)
+# attr-char = %x9 / %xA / %xD / %x20-3D / %x3F-D7FF / %xE000-FFFD / %x10000-10FFFF
 
-def extract(id, title, page, out):
-    """
-    :param page: a list of lines.
-    """
-    text = '\n'.join(page)
-    url = get_url(prefix, id)
-    header = '<doc id="%s" url="%s" title="%s">\n' % (id, url, title)
-    # Separate header from text with a newline.
-    header += title + '\n'
-    header = header.encode('utf-8')
-    text = clean(text)
-    footer = "\n</doc>"
-    out.reserve(len(header) + len(text) + len(footer))
-    print >> out, header
-    for line in compact(text):
-        print >> out, line.encode('utf-8')
-    print >> out, footer
+# literal         = *xml-char
+# title           = wikitext-L3
+# part-name       = wikitext-L3
+# part-value      = wikitext-L3
+# part            = ( part-name "=" part-value ) / ( part-value )
+# parts           = [ title *( "|" part ) ]
+# tplarg          = "{{{" parts "}}}"
+# template        = "{{" parts "}}"
+# link            = "[[" wikitext-L3 "]]"
 
-def get_url(prefix, id):
-    return "%s?curid=%s" % (prefix, id)
+# comment         = "<!--" literal "-->"
+# unclosed-comment = "<!--" literal END
+# ; the + in the line-eating-comment rule was absent between MW 1.12 and MW 1.22
+# line-eating-comment = LF LINE-START *SP +( comment *SP ) LINE-END
+
+# attr            = *attr-char
+# nowiki-element  = "<nowiki" attr ( "/>" / ( ">" literal ( "</nowiki>" / END ) ) )
+
+# wikitext-L2     = heading / wikitext-L3 / *wikitext-L2
+# wikitext-L3     = literal / template / tplarg / link / comment /
+#                   line-eating-comment / unclosed-comment / xmlish-element /
+#                   *wikitext-L3
 
 #------------------------------------------------------------------------------
 
-selfClosingTags = [ 'br', 'hr', 'nobr', 'ref', 'references' ]
+selfClosingTags = [ 'br', 'hr', 'nobr', 'ref', 'references', 'nowiki' ]
 
 # These tags are dropped, keeping their content.
 # handle 'a' separately, depending on keepLinks
 ignoredTags = [
-        'b', 'big', 'blockquote', 'center', 'cite', 'div', 'em',
-        'font', 'h1', 'h2', 'h3', 'h4', 'hiero', 'i', 'kbd', 'nowiki',
-        'p', 'plaintext', 's', 'small', 'span', 'strike', 'strong',
-        'sub', 'sup', 'tt', 'u', 'var'
+    'abbr', 'b', 'big', 'blockquote', 'center', 'cite', 'div', 'em',
+    'font', 'h1', 'h2', 'h3', 'h4', 'hiero', 'i', 'kbd', 'nowiki',
+    'p', 'plaintext', 's', 'span', 'strike', 'strong',
+    'sub', 'sup', 'tt', 'u', 'var'
 ]
 
 placeholder_tags = {'math':'formula', 'code':'codice'}
@@ -219,12 +212,6 @@ def unescape(text):
 # The buggy template {{Template:T}} has a comment terminating with just "->"
 comment = re.compile(r'<!--.*?-->', re.DOTALL)
 
-# Match elements to ignore
-discard_element_patterns = []
-for tag in discardElements:
-    pattern = re.compile(r'<\s*%s\b[^>]*>.*?<\s*/\s*%s>' % (tag, tag), re.DOTALL | re.IGNORECASE)
-    discard_element_patterns.append(pattern)
-
 # Match ignored tags
 ignored_tag_patterns = []
 def ignoreTag(tag):
@@ -236,29 +223,28 @@ for tag in ignoredTags:
     ignoreTag(tag)
 
 # Match selfClosing HTML tags
-selfClosing_tag_patterns = []
-for tag in selfClosingTags:
-    pattern = re.compile(r'<\s*%s\b[^/]*/\s*>' % tag, re.DOTALL | re.IGNORECASE)
-    selfClosing_tag_patterns.append(pattern)
+selfClosing_tag_patterns = [
+    re.compile(r'<\s*%s\b[^>]*/\s*>' % tag, re.DOTALL | re.IGNORECASE) for tag in selfClosingTags
+]
 
 # Match HTML placeholder tags
-placeholder_tag_patterns = []
-for tag, repl in placeholder_tags.items():
-    pattern = re.compile(r'<\s*%s(\s*| [^>]+?)>.*?<\s*/\s*%s\s*>' % (tag, tag), re.DOTALL | re.IGNORECASE)
-    placeholder_tag_patterns.append((pattern, repl))
+placeholder_tag_patterns = [
+    (re.compile(r'<\s*%s(\s*| [^>]+?)>.*?<\s*/\s*%s\s*>' % (tag, tag), re.DOTALL | re.IGNORECASE),
+     repl) for tag, repl in placeholder_tags.items()
+]
 
 # Match preformatted lines
-preformatted = re.compile(r'^ .*?$', re.MULTILINE)
+preformatted = re.compile(r'^ .*?$')
 
 # Match external links (space separates second optional parameter)
 externalLink = re.compile(r'\[\w+[^ ]*? (.*?)]')
 externalLinkNoAnchor = re.compile(r'\[\w+[&\]]*\]')
 
 # Matches bold/italic
-bold_italic = re.compile(r"'''''([^']*?)'''''")
-bold = re.compile(r"'''([^']*?)'''")
+bold_italic = re.compile(r"'''''(.*?)'''''")
+bold = re.compile(r"'''(.*?)'''")
 italic_quote = re.compile(r"''\"([^\"]*?)\"''")
-italic = re.compile(r"''([^']*)''")
+italic = re.compile(r"''(.*?)''")
 quote_quote = re.compile(r'""([^"]*?)""')
 
 # Matches space
@@ -267,73 +253,443 @@ spaces = re.compile(r' {2,}')
 # Matches dots
 dots = re.compile(r'\.{4,}')
 
-#----------------------------------------------------------------------
-# Expand templates
+#======================================================================
 
-# Derived from:
-# wikiprep.pl - Preprocess Wikipedia XML dumps
-# Copyright (C) 2007 Evgeniy Gabrilovich
-
-maxTemplateRecursionLevels = 16
-maxParameterRecursionLevels = 10
-
-# check for template beginning
-reOpen = re.compile('(?<!{){{(?!{)', re.DOTALL)
-
-def expandTemplates(text, frame=[]):
+class Template(list):
     """
-    :param frame: contains pairs (title, args) of previous invocations.
-    Template definitions can span several lines.
-
-    Templates are frequently nested. Occasionally, parsing mistakes may cause
-    template insertion to enter an infinite loop, for instance when trying to
-    instantiate Template:Country
-
-    {{country_{{{1}}}|{{{2}}}|{{{2}}}|size={{{size|}}}|name={{{name|}}}}}
-
-    which is repeatedly trying to insert template 'country_', which is again
-    resolved to Template:Country. The straightforward solution of keeping
-    track of templates that were already inserted for the current article
-    would not work, because the same template may legally be used more than
-    once, with different parameters in different parts of the article.
-    Therefore, we limit the number of iterations of nested template inclusion.
+    A Template is a list of TemplateText or TemplateArgs
     """
 
-    # This evaluates expressions outside in.
-    # Recursion:
-    #   expandTemplates(text, l)
-    #     repeat maxTemplateRecursionLevels
-    #        for templ_i in text
-    #            replace templ_i with expandTemplate(templ_i)
-    #                                    expandTemplates(instantatiated templ_i, l+1)
-    #        until no templates present
+    @classmethod
+    def parse(cls, body):
+        tpl = Template()
+        # we must handle nesting, s.a.
+        # {{{1|{{PAGENAME}}}
+        # {{{italics|{{{italic|}}}
+        # {{#if:{{{{{#if:{{{nominee|}}}|nominee|candidate}}|}}}|
+        #
+        start = 0
+        for s,e in findMatchingBraces(body, 3):
+            tpl.append(TemplateText(body[start:s]))
+            tpl.append(TemplateArg(body[s+3:e-3]))
+            start = e
+        tpl.append(TemplateText(body[start:])) # leftover
+        return tpl
 
-    for l in xrange(maxTemplateRecursionLevels):
+    def subst(self, params, extractor, depth=0):
+        # We perform parameter substitutions recursively.
+        # We also limit the maximum number of iterations to avoid too long or
+        # even endless loops (in case of malformed input).
+
+        # :see: http://meta.wikimedia.org/wiki/Help:Expansion#Distinction_between_variables.2C_parser_functions.2C_and_templates
+        #
+        # Parameter values are assigned to parameters in two (?) passes.
+        # Therefore a parameter name in a template can depend on the value of
+        # another parameter of the same template, regardless of the order in
+        # which they are specified in the template call, for example, using
+        # Template:ppp containing "{{{{{{p}}}}}}", {{ppp|p=q|q=r}} and even
+        # {{ppp|q=r|p=q}} gives r, but using Template:tvvv containing
+        # "{{{{{{{{{p}}}}}}}}}", {{tvvv|p=q|q=r|r=s}} gives s.
+
+        logging.debug('subst tpl (%d, %d) %s', len(extractor.frame), depth, self)
+
+        if depth > extractor.maxParameterRecursionLevels:
+            logging.warn('Reachead maximum parameter recursions: %d',
+                         extractor.maxParameterRecursionLevels)
+            return ''
+
+        return ''.join([tpl.subst(params, extractor, depth) for tpl in self])
+
+    def __str__(self):
+        return ''.join([unicode(x) for x in self])
+
+class TemplateText(unicode):
+    """Fixed text of template"""
+
+    def subst(self, params, extractor, depth):
+        return self
+
+class TemplateArg(object):
+    """
+    parameter to a template.
+    Has a name and a default value, both of which are Templates.
+    """
+    def __init__(self, parameter):
+        """
+        :param parameter: the parts of a tplarg.
+        """
+        # the parameter name itself might contain templates, e.g.:
+        #   appointe{{#if:{{{appointer14|}}}|r|d}}14|
+        #   4|{{{{{subst|}}}CURRENTYEAR}}
+
+        # any parts in a tplarg after the first (the parameter default) are
+        # ignored, and an equals sign in the first part is treated as plain text.
+        #logging.debug('TemplateArg %s', parameter)
+
+        parts = splitParts(parameter)
+        self.name = Template.parse(parts[0])
+        if len(parts) > 1:
+            # This parameter has a default value
+            self.default = Template.parse(parts[1])
+        else:
+            self.default = None
+
+    def __str__(self):
+        if self.default:
+            return '{{{%s|%s}}}' % (self.name, self.default)
+        else:
+            return '{{{%s}}}' % self.name
+
+    def subst(self, params, extractor, depth):
+        """
+        Substitute value for this argument from dict :param params:
+        Use :param extractor: to evaluate expressions for name and default.
+        Limit substitution to the maximun :param depth:.
+        """
+        # the parameter name itself might contain templates, e.g.:
+        # appointe{{#if:{{{appointer14|}}}|r|d}}14|
+        paramName = self.name.subst(params, extractor, depth+1)
+        paramName = extractor.expandTemplates(paramName)
         res = ''
+        if paramName in params:
+            res = params[paramName]  # use parameter value specified in template invocation
+        elif self.default:            # use the default value
+            defaultValue = self.default.subst(params, extractor, depth+1)
+            res =  extractor.expandTemplates(defaultValue)
+        logging.debug('subst arg %d %s -> %s' % (depth, paramName, res))
+        return res
+
+#======================================================================
+
+substWords = 'subst:|safesubst:'
+
+class Extractor(object):
+    """
+    An extraction task on a article.
+    """
+    ##
+    # Whether to preserve links in output
+    keepLinks = False
+
+    ##
+    # Whether to transform sections into HTML
+    keepSections = False
+
+    ##
+    # Whether to output HTML instead of text
+    toHTML = False
+
+    def __init__(self, id, title, page):
+        """
+        :param page: a list of lines.
+        """
+        self.id = id
+        self.title = title
+        self.page = page
+        self.magicWords = MagicWords()
+        self.frame = []
+
+    def extract(self, out=sys.stdout):
+        logging.info("%s\t%s", self.id, self.title)
+        text = ''.join(self.page)
+        url = get_url(self.id)
+        header = '<doc id="%s" url="%s" title="%s">\n' % (self.id, url, self.title)
+        # Separate header from text with a newline.
+        header += self.title + '\n\n'
+        header = header.encode('utf-8')
+        self.magicWords['pagename'] = self.title
+        self.magicWords['fullpagename'] = self.title
+        self.magicWords['currentyear'] = time.strftime('%Y')
+        self.magicWords['currentmonth'] = time.strftime('%m')
+        self.magicWords['currentday'] = time.strftime('%d')
+        self.magicWords['currenthour'] = time.strftime('%H')
+        self.magicWords['currenttime'] = time.strftime('%H:%M:%S')
+        text = clean(self, text)
+        footer = "\n</doc>\n"
+        if out != sys.stdout:
+            out.reserve(len(header) + len(text) + len(footer))
+        out.write(header)
+        for line in compact(text):
+            out.write(line.encode('utf-8'))
+            out.write('\n')
+        out.write(footer)
+
+    #----------------------------------------------------------------------
+    # Expand templates
+
+    maxTemplateRecursionLevels = 30
+    maxParameterRecursionLevels = 10
+
+    # check for template beginning
+    reOpen = re.compile('(?<!{){{(?!{)', re.DOTALL)
+
+    def expandTemplates(self, wikitext):
+        """
+        :param wikitext: the text to be expanded.
+
+        Templates are frequently nested. Occasionally, parsing mistakes may
+        cause template insertion to enter an infinite loop, for instance when
+        trying to instantiate Template:Country
+
+        {{country_{{{1}}}|{{{2}}}|{{{2}}}|size={{{size|}}}|name={{{name|}}}}}
+
+        which is repeatedly trying to insert template 'country_', which is
+        again resolved to Template:Country. The straightforward solution of
+        keeping track of templates that were already inserted for the current
+        article would not work, because the same template may legally be used
+        more than once, with different parameters in different parts of the
+        article.  Therefore, we limit the number of iterations of nested
+        template inclusion.
+
+        """
+        # Test template expansion at:
+        # https://en.wikipedia.org/wiki/Special:ExpandTemplates
+
+        res = ''
+        if len(self.frame) >= self.maxTemplateRecursionLevels:
+            logging.warn('Max template recursion exceeded!')
+            return res
+
+        #logging.debug('<expandTemplates ' + str(len(self.frame)))
+
         cur = 0
         # look for matching {{...}}
-        for s,e in findMatchingBraces(text, '{{', 2):
-            res += text[cur:s]
-            res += expandTemplate(text[s+2:e-2], frame)
+        for s,e in findMatchingBraces(wikitext, 2):
+            res += wikitext[cur:s] + self.expandTemplate(wikitext[s+2:e-2])
             cur = e
-
-        if cur == 0:
-            return text
         # leftover
-        res += text[cur:]
-        text = res
+        res += wikitext[cur:]
+        if cur:
+            logging.debug('   expandTemplates> %d %s', len(self.frame), res)
+        return res
 
-    logging.warn('Reached max template recursion: '
-                 + str(maxTemplateRecursionLevels))
-    return text
+    def templateParams(self, parameters):
+        """
+        Build a dictionary with positional or name key to expanded parameters.
+        :param parameters: the parts[1:] of a template, i.e. all except the title.
+        :param depth: recusion depth.
+        """
+        templateParams = {}
+
+        if not parameters:
+            return templateParams
+        logging.debug('<templateParams: %s', '|'.join(parameters))
+
+        # Parameters can be either named or unnamed. In the latter case, their
+        # name is defined by their ordinal position (1, 2, 3, ...).
+
+        unnamedParameterCounter = 0
+
+        # It's legal for unnamed parameters to be skipped, in which case they
+        # will get default values (if available) during actual instantiation.
+        # That is {{template_name|a||c}} means parameter 1 gets
+        # the value 'a', parameter 2 value is not defined, and parameter 3 gets
+        # the value 'c'.  This case is correctly handled by function 'split',
+        # and does not require any special handling.
+        for param in parameters:
+            # Spaces before or after a parameter value are normally ignored,
+            # UNLESS the parameter contains a link (to prevent possible gluing
+            # the link to the following text after template substitution)
+
+            # Parameter values may contain "=" symbols, hence the parameter
+            # name extends up to the first such symbol.
+
+            # It is legal for a parameter to be specified several times, in
+            # which case the last assignment takes precedence. Example:
+            # "{{t|a|b|c|2=B}}" is equivalent to "{{t|a|B|c}}".
+            # Therefore, we don't check if the parameter has been assigned a
+            # value before, because anyway the last assignment should override
+            # any previous ones.
+            # FIXME: Don't use DOTALL here since parameters may be tags with
+            # attributes, e.g. <div class="templatequotecite">
+            # Parameters may span several lines, like:
+            # {{Reflist|colwidth=30em|refs=
+            # &lt;ref name=&quot;Goode&quot;&gt;Title&lt;/ref&gt;
+
+            # The '=' might occurr within an HTML attribute:
+            #   "&lt;ref name=value"
+            # but we stop at first.
+            m = re.match(' *([^= ]*?) *=(.*)', param, re.DOTALL)
+            if m:
+                # This is a named parameter.  This case also handles parameter
+                # assignments like "2=xxx", where the number of an unnamed
+                # parameter ("2") is specified explicitly - this is handled
+                # transparently.
+
+                parameterName = m.group(1).strip()
+                parameterValue = m.group(2)
+
+                if ']]' not in parameterValue: # if the value does not contain a link, trim whitespace
+                    parameterValue = parameterValue.strip()
+                templateParams[parameterName] = parameterValue
+            else:
+                # this is an unnamed parameter
+                unnamedParameterCounter += 1
+
+                if ']]' not in param: # if the value does not contain a link, trim whitespace
+                    param = param.strip()
+                templateParams[str(unnamedParameterCounter)] = param
+        logging.debug('   templateParams> %s', '|'.join(templateParams.values()))
+        return templateParams
+
+    def expandTemplate(self, body):
+        """Expands template invocation.
+        :param body: the parts of a template.
+
+        :see http://meta.wikimedia.org/wiki/Help:Expansion for an explanation
+        of the process.
+
+        See in particular: Expansion of names and values
+        http://meta.wikimedia.org/wiki/Help:Expansion#Expansion_of_names_and_values
+
+        For most parser functions all names and values are expanded,
+        regardless of what is relevant for the result. The branching functions
+        (#if, #ifeq, #iferror, #ifexist, #ifexpr, #switch) are exceptions.
+
+        All names in a template call are expanded, and the titles of the
+        tplargs in the template body, after which it is determined which
+        values must be expanded, and for which tplargs in the template body
+        the first part (default).
+
+        In the case of a tplarg, any parts beyond the first are never
+        expanded.  The possible name and the value of the first part is
+        expanded if the title does not match a name in the template call.
+
+        :see code for braceSubstitution at
+        https://doc.wikimedia.org/mediawiki-core/master/php/html/Parser_8php_source.html#3397:
+
+        """
+
+        # template        = "{{" parts "}}"
+
+        # Templates and tplargs are decomposed in the same way, with pipes as
+        # separator, even though eventually any parts in a tplarg after the first
+        # (the parameter default) are ignored, and an equals sign in the first
+        # part is treated as plain text.
+        # Pipes inside inner templates and tplargs, or inside double rectangular
+        # brackets within the template or tplargs are not taken into account in
+        # this decomposition.
+        # The first part is called title, the other parts are simply called parts.
+
+        # If a part has one or more equals signs in it, the first equals sign
+        # determines the division into name = value. Equals signs inside inner
+        # templates and tplargs, or inside double rectangular brackets within the
+        # part are not taken into account in this decomposition. Parts without
+        # equals sign are indexed 1, 2, .., given as attribute in the <name> tag.
+
+        if len(self.frame) >= self.maxTemplateRecursionLevels:
+            logging.warn('Reached max template recursion: %d',
+                         self.maxTemplateRecursionLevels)
+            logging.debug('   INVOCATION> %d %s', len(self.frame), body)
+            return ''
+
+        logging.debug('INVOCATION %d %s', len(self.frame), body)
+
+        parts = splitParts(body)
+        # title is the portion before the first |
+        logging.debug('TITLE %s', parts[0].strip())
+        title = self.expandTemplates(parts[0].strip())
+
+        # SUBST
+        # Apply the template tag to parameters without
+        # substituting into them, e.g.
+        # {{subst:t|a{{{p|q}}}b}} gives the wikitext start-a{{{p|q}}}b-end
+        # @see https://www.mediawiki.org/wiki/Manual:Substitution#Partial_substitution
+        subst = False
+        if re.match(substWords, title, re.IGNORECASE):
+            title = re.sub(substWords, '', title, 1, re.IGNORECASE)
+            subst = True
+
+        if title.lower() in self.magicWords.values:
+            return self.magicWords[title.lower()]
+
+        # Parser functions
+        # The first argument is everything after the first colon.
+        # It has been evaluated above.
+        colon = title.find(':')
+        if colon > 1:
+            funct = title[:colon]
+            parts[0] = title[colon+1:].strip() # side-effect (parts[0] not used later)
+            # arguments after first are not evaluated
+            ret = callParserFunction(funct, parts, self.frame)
+            return self.expandTemplates(ret)
+
+        title = fullyQualifiedTemplateTitle(title)
+
+        redirected = redirects.get(title)
+        if redirected:
+            title = redirected
+
+        # get the template
+        if title in templateCache:
+            template = templateCache[title]
+        elif title in templates:
+            template = Template.parse(templates[title])
+            # add it to cache
+            templateCache[title] = template
+            del templates[title]
+        else:
+            # The page being included could not be identified
+            return ''
+
+        logging.debug('TEMPLATE %s: %s', title, template)
+
+        # tplarg          = "{{{" parts "}}}"
+        # parts           = [ title *( "|" part ) ]
+        # part            = ( part-name "=" part-value ) / ( part-value )
+        # part-name       = wikitext-L3
+        # part-value      = wikitext-L3
+        # wikitext-L3     = literal / template / tplarg / link / comment /
+        #                   line-eating-comment / unclosed-comment /
+        #		    xmlish-element / *wikitext-L3
+
+        # A tplarg may contain other parameters as well as templates, e.g.:
+        #   {{{text|{{{quote|{{{1|{{error|Error: No text given}}}}}}}}}}}
+        # hence no simple RE like this would work:
+        #   '{{{((?:(?!{{{).)*?)}}}'
+        # We must use full CF parsing.
+
+        # the parameter name itself might be computed, e.g.:
+        #   {{{appointe{{#if:{{{appointer14|}}}|r|d}}14|}}}
+
+        # Because of the multiple uses of double-brace and triple-brace
+        # syntax, expressions can sometimes be ambiguous.
+        # Precedence rules specifed here:
+        # http://www.mediawiki.org/wiki/Preprocessor_ABNF#Ideal_precedence
+        # resolve ambiguities like this:
+        #   {{{{ }}}} -> { {{{ }}} }
+        #   {{{{{ }}}}} -> {{ {{{ }}} }}
+        #
+        # :see: https://en.wikipedia.org/wiki/Help:Template#Handling_parameters
+
+        params = parts[1:]
+
+        if not subst:
+            # Evaluate parameters, since they may contain templates, including
+            # the symbol "=".
+            # {{#ifexpr: {{{1}}} = 1 }}
+            params = [self.expandTemplates(p) for p in params]
+
+        # build a dict of name-values for the parameter values
+        params = self.templateParams(params)
+
+        # Perform parameter substitution
+        instantiated = template.subst(params, self)
+        logging.debug('instantiated %d %s', len(self.frame), instantiated)
+        self.frame.append((title, params))
+        value = self.expandTemplates(instantiated)
+        self.frame.pop()
+        logging.debug('   INVOCATION> %s %d %s', title, len(self.frame), value)
+        return value
 
 # ----------------------------------------------------------------------
 # parameter handling
 
-def splitParameters(paramsList, sep='|'):
+def splitParts(paramsList):
     """
-    Split template parameters at the separator :param sep:, which defaults to
-    "|". The fuction can be used also to split also key-value pairs at the
+    :param paramList: the parts of a template or tplarg.
+
+    Split template parameters at the separator "|".
     separator "=".
 
     Template parameters often contain URLs, internal links, text or even
@@ -352,15 +708,24 @@ def splitParameters(paramsList, sep='|'):
        }}
      }}
 
-    We split parameters at the "|" symbols that are not inside any pair
+    We split parts at the "|" symbols that are not inside any pair
     {{{...}}}, {{...}}, [[...]], {|...|}.
     """
 
+    # Must consider '[' as normal in expansion of Template:EMedicine2:
+    # #ifeq: ped|article|[http://emedicine.medscape.com/article/180-overview|[http://www.emedicine.com/ped/topic180.htm#{{#if: |section~}}
+    # as part of:
+    # {{#ifeq: ped|article|[http://emedicine.medscape.com/article/180-overview|[http://www.emedicine.com/ped/topic180.htm#{{#if: |section~}}}} ped/180{{#if: |~}}]
+
+    # should handle both tpl arg like:
+    #    4|{{{{{subst|}}}CURRENTYEAR}}
+    # and tpl parameters like:
+    #    ||[[Category:People|{{#if:A|A|{{PAGENAME}}}}]]
+
+    sep = '|'
     parameters = []
     cur = 0
-    for s,e in findBalanced(paramsList,
-                            ['{{{', '{{', '[[', '{|'],
-                            ['}}}', '}}', ']]', '|}']):
+    for s,e in findMatchingBraces(paramsList):
         par = paramsList[cur:s].split(sep)
         if par:
             if parameters:
@@ -388,128 +753,134 @@ def splitParameters(paramsList, sep='|'):
         else:
             parameters = par
 
+    #logging.debug('splitParts %s %s\nparams: %s', sep, paramsList, str(parameters))
     return parameters
 
-def templateParams(parameters):
+def findMatchingBraces(text, ldelim=0):
     """
-    Build a dictionary with positional or name key to parameters.
+    :param ldelim: number of braces to match. 0 means match [[]], {{}} and {{{}}}.
     """
-    templateParams = {}
+    # Parsing is done with respect to pairs of double braces {{..}} delimiting
+    # a template, and pairs of triple braces {{{..}}} delimiting a tplarg.
+    # If double opening braces are followed by triple closing braces or
+    # conversely, this is taken as delimiting a template, with one left-over
+    # brace outside it, taken as plain text. For any pattern of braces this
+    # defines a set of templates and tplargs such that any two are either
+    # separate or nested (not overlapping).
 
-    if not parameters:
-        return templateParams
+    # Unmatched double rectangular closing brackets can be in a template or
+    # tplarg, but unmatched double rectangular opening brackets cannot.
+    # Unmatched double or triple closing braces inside a pair of
+    # double rectangular brackets are treated as plain text.
+    # Other formulation: in ambiguity between template or tplarg on one hand,
+    # and a link on the other hand, the structure with the rightmost opening
+    # takes precedence, even if this is the opening of a link without any
+    # closing, so not producing an actual link.
 
-    # evaluate parameters, sice they may contain templates, including the
-    # symbol "=".
-    # {{#ifexpr: {{{1}}} = 1 }}
-    for i,p in enumerate(parameters):
-        parameters[i] = expandTemplates(p)
+    # In the case of more than three opening braces the last three are assumed
+    # to belong to a tplarg, unless there is no matching triple of closing
+    # braces, in which case the last two opening braces are are assumed to
+    # belong to a template.
 
-    # Parameters can be either named or unnamed. In the latter case, their
-    # name is defined by their ordinal position (1, 2, 3, ...).
+    # We must skip individual { like in:
+    #   {{#ifeq: {{padleft:|1|}} | { | | &nbsp;}}
+    # We must resolve ambiguities like this:
+    #   {{{{ }}}} -> { {{{ }}} }
+    #   {{{{{ }}}}} -> {{ {{{ }}} }}
+    #   {{#if:{{{{{#if:{{{nominee|}}}|nominee|candidate}}|}}}|...}}
 
-    unnamedParameterCounter = 0
+    # Handle:
+    #   {{{{{|safesubst:}}}#Invoke:String|replace|{{{1|{{{{{|safesubst:}}}PAGENAME}}}}}|%s+%([^%(]-%)$||plain=false}}
+    # as well as expressions with stray }:
+    #   {{{link|{{ucfirst:{{{1}}}}}} interchange}}}
 
-    # It's legal for unnamed parameters to be skipped, in which case they
-    # will get default values (if available) during actual instantiation.
-    # That is {{template_name|a||c}} means parameter 1 gets
-    # the value 'a', parameter 2 value is not defined, and parameter 3 gets
-    # the value 'c'.  This case is correctly handled by function 'split',
-    # and does not require any special handling.
-    for param in parameters:
-        # Spaces before or after a parameter value are normally ignored,
-        # UNLESS the parameter contains a link (to prevent possible gluing
-        # the link to the following text after template substitution)
+    if ldelim:                                   # 2-3
+        reOpen = re.compile('[{]{%d,}' % ldelim) # at least ldelim
+        reNext = re.compile('[{]{2,}|}{2,}') # at least 2
+    else:
+        reOpen = re.compile('{{2,}|\[{2,}')
+        reNext = re.compile('{{2,}|}{2,}|\[{2,}|]{2,}') # at least 2
 
-        # Parameter values may contain "=" symbols, hence the parameter
-        # name extends up to the first such symbol.
-
-        # It is legal for a parameter to be specified several times, in
-        # which case the last assignment takes precedence. Example:
-        # "{{t|a|b|c|2=B}}" is equivalent to "{{t|a|B|c}}".
-        # Therefore, we don't check if the parameter has been assigned a
-        # value before, because anyway the last assignment should override
-        # any previous ones.
-        # Don't use DOTALL here since parameters may be tags with
-        # attributes, e.g. <div class="templatequotecite">
-
-        m = re.match('([^=]*)=(.*)$', param)
-        if m:
-            # This is a named parameter.  This case also handles parameter
-            # assignments like "2=xxx", where the number of an unnamed
-            # parameter ("2") is specified explicitly - this is handled
-            # transparently.
-
-            parameterName = m.group(1)
-            parameterValue = m.group(2)
-          
-            parameterName = parameterName.strip()
-            if ']]' not in parameterValue: # if the value does not contain a link, trim whitespace
-                parameterValue = parameterValue.strip()
-            templateParams[parameterName] = parameterValue
-        else:
-            # this is an unnamed parameter
-            unnamedParameterCounter += 1
-
-            if ']]' not in param: # if the value does not contain a link, trim whitespace
-                param = param.strip()
-            templateParams[str(unnamedParameterCounter)] = param
-    return templateParams
-
-def findMatchingBraces(text, openDelim, ldelim):
-    reOpen = re.compile(openDelim)
     cur = 0
-    # scan text after {{ looking for matching }}
     while True:
-        m = reOpen.search(text, cur)
-        if m:
-            npar = ldelim
-            for i in xrange(m.end(), len(text)):
-                if text[i] == '{':
-                    npar += 1
-                elif text[i] == '}':
-                    npar -= 1
-                    if npar == 0:
-                        yield m.start(), i+1
-                        cur = i+1
-                        break
-            else:
-                # unbalanced
-                return
-        else:
+        m1 = reOpen.search(text, cur)
+        if not m1:
             return
+        lmatch = m1.end()-m1.start()
+        if m1.group()[0] == '{':
+            stack = [lmatch]    # stack of opening braces lengths
+        else:
+            stack = [-lmatch]   # negative means [
+        end = m1.end()
+        while True:
+            m2 = reNext.search(text, end)
+            if not m2:
+                return      # unbalanced
+            end = m2.end()
+            brac = m2.group()[0]
+            lmatch = m2.end()-m2.start()
 
-def findBalanced(text, openDelim, closeDelim, openPatterns=None,
-                 startDelim=None):
+            if brac == '{':
+                stack.append(lmatch)
+            elif brac == '}':
+                while stack:
+                    openCount = stack.pop() # opening span
+                    if openCount == 0:      # illegal unmatched [[
+                        continue
+                    if lmatch >= openCount:
+                        lmatch -= openCount
+                        if lmatch <= 1: # either close or stray }
+                            break
+                    else:
+                        # put back unmatched
+                        stack.append(openCount - lmatch)
+                        break
+                if not stack:
+                    yield m1.start(), end-lmatch
+                    cur = end
+                    break
+                elif len(stack) == 1 and 0 < stack[0] < ldelim:
+                    # ambiguous {{{{{ }}} }}
+                    yield m1.start() + stack[0], end
+                    cur = end
+                    break
+            elif brac == '[': # [[
+                stack.append(-lmatch)
+            else:               # ]]
+                while stack and stack[-1] < 0: # matching [[
+                    openCount = -stack.pop()
+                    if lmatch >= openCount:
+                        lmatch -= openCount
+                        if lmatch <= 1: # either close or stray ]
+                            break
+                    else:
+                        # put back unmatched (negative)
+                        stack.append(lmatch - openCount)
+                        break
+                if not stack:
+                    yield m1.start(), end-lmatch
+                    cur = end
+                    break
+                # unmatched ]] are discarded
+                cur = end
+
+def findBalanced(text, openDelim, closeDelim):
     """
     Assuming that text contains a properly balanced expression using
     :param openDelim: as opening delimiters and
     :param closeDelim: as closing delimiters.
-    :param openPatterns: use these regex patterns for matching open delimiters.
-      Sometimes patterns are ambiguous, hence specifying '{{{(?!{)' avoids
-      matching '{{{{' for '{{{'.
-    :param startDelim: start searching for this delimiter.
     :return: an iterator producing pairs (start, end) of start and end
     positions in text containing a balanced expression.
     """
-    if openPatterns:
-        openPat = '|'.join(openPatterns)
-    else:
-        openPat = '|'.join([re.escape(x) for x in openDelim])
+    openPat = '|'.join([re.escape(x) for x in openDelim])
     # patter for delimiters expected after each opening delimiter
-    afterPat = { o:re.compile(openPat+'|'+c, re.DOTALL) for o,c in izip(openDelim, closeDelim)} 
+    afterPat = { o:re.compile(openPat+'|'+c, re.DOTALL) for o,c in izip(openDelim, closeDelim)}
     stack = []
     start = 0
     cur = 0
     end = len(text)
     startSet = False
-    if startDelim is not None:
-        if openPatterns:
-            startPat = re.compile(openPatterns[startDelim])
-        else:
-            startPat = re.compile(openDelim[startDelim])
-    else:
-        startPat = re.compile(openPat)
+    startPat = re.compile(openPat)
     nextPat = startPat
     while True:
         next = nextPat.search(text, cur)
@@ -549,238 +920,127 @@ modules = {
 # ----------------------------------------------------------------------
 # variables
 
-# FIXME: we just discard them.
-magicWords = set([
-    '!',
-    'currentmonth',
-    'currentmonth1',
-    'currentmonthname',
-    'currentmonthnamegen',
-    'currentmonthabbrev',
-    'currentday',
-    'currentday2',
-    'currentdayname',
-    'currentyear',
-    'currenttime',
-    'currenthour',
-    'localmonth',
-    'localmonth1',
-    'localmonthname',
-    'localmonthnamegen',
-    'localmonthabbrev',
-    'localday',
-    'localday2',
-    'localdayname',
-    'localyear',
-    'localtime',
-    'localhour',
-    'numberofarticles',
-    'numberoffiles',
-    'numberofedits',
-    'articlepath',
-    'pageid',
-    'sitename',
-    'server',
-    'servername',
-    'scriptpath',
-    'stylepath',
-    'pagename',
-    'pagenamee',
-    'fullpagename',
-    'fullpagenamee',
-    'namespace',
-    'namespacee',
-    'namespacenumber',
-    'currentweek',
-    'currentdow',
-    'localweek',
-    'localdow',
-    'revisionid',
-    'revisionday',
-    'revisionday2',
-    'revisionmonth',
-    'revisionmonth1',
-    'revisionyear',
-    'revisiontimestamp',
-    'revisionuser',
-    'revisionsize',
-    'subpagename',
-    'subpagenamee',
-    'talkspace',
-    'talkspacee',
-    'subjectspace',
-    'subjectspacee',
-    'talkpagename',
-    'talkpagenamee',
-    'subjectpagename',
-    'subjectpagenamee',
-    'numberofusers',
-    'numberofactiveusers',
-    'numberofpages',
-    'currentversion',
-    'rootpagename',
-    'rootpagenamee',
-    'basepagename',
-    'basepagenamee',
-    'currenttimestamp',
-    'localtimestamp',
-    'directionmark',
-    'contentlanguage',
-    'numberofadmins',
-    'cascadingsources',
-])
+class MagicWords(object):
+    """
+    One copy in each Extractor.
+
+    @see https://doc.wikimedia.org/mediawiki-core/master/php/MagicWord_8php_source.html
+    """
+    names = [
+        '!',
+        'currentmonth',
+        'currentmonth1',
+        'currentmonthname',
+        'currentmonthnamegen',
+        'currentmonthabbrev',
+        'currentday',
+        'currentday2',
+        'currentdayname',
+        'currentyear',
+        'currenttime',
+        'currenthour',
+        'localmonth',
+        'localmonth1',
+        'localmonthname',
+        'localmonthnamegen',
+        'localmonthabbrev',
+        'localday',
+        'localday2',
+        'localdayname',
+        'localyear',
+        'localtime',
+        'localhour',
+        'numberofarticles',
+        'numberoffiles',
+        'numberofedits',
+        'articlepath',
+        'pageid',
+        'sitename',
+        'server',
+        'servername',
+        'scriptpath',
+        'stylepath',
+        'pagename',
+        'pagenamee',
+        'fullpagename',
+        'fullpagenamee',
+        'namespace',
+        'namespacee',
+        'namespacenumber',
+        'currentweek',
+        'currentdow',
+        'localweek',
+        'localdow',
+        'revisionid',
+        'revisionday',
+        'revisionday2',
+        'revisionmonth',
+        'revisionmonth1',
+        'revisionyear',
+        'revisiontimestamp',
+        'revisionuser',
+        'revisionsize',
+        'subpagename',
+        'subpagenamee',
+        'talkspace',
+        'talkspacee',
+        'subjectspace',
+        'subjectspacee',
+        'talkpagename',
+        'talkpagenamee',
+        'subjectpagename',
+        'subjectpagenamee',
+        'numberofusers',
+        'numberofactiveusers',
+        'numberofpages',
+        'currentversion',
+        'rootpagename',
+        'rootpagenamee',
+        'basepagename',
+        'basepagenamee',
+        'currenttimestamp',
+        'localtimestamp',
+        'directionmark',
+        'contentlanguage',
+        'numberofadmins',
+        'cascadingsources',
+    ]
+
+    def __init__(self):
+        self.values = {}
+        self.values['!'] = '|'
+
+    def __getitem__(self, name):
+        return self.values.get(name)
+
+    def __setitem__(self, name, value):
+        self.values[name] = value
+
+    switches = [
+        '__NOTOC__',
+        '__FORCETOC__',
+        '__TOC__',
+        '__TOC__',
+        '__NEWSECTIONLINK__',
+        '__NONEWSECTIONLINK__',
+        '__NOGALLERY__',
+        '__HIDDENCAT__',
+        '__NOCONTENTCONVERT__',
+        '__NOCC__',
+        '__NOTITLECONVERT__',
+        '__NOTC__',
+        '__START__',
+        '__END__',
+        '__INDEX__',
+        '__NOINDEX__',
+        '__STATICREDIRECT__',
+        '__DISAMBIG__'
+        ]
+
+magicWordsRE = re.compile('|'.join(MagicWords.switches))
 
 # ----------------------------------------------------------------------
-
-substWords = 'subst:|safesubst:'
-
-def expandTemplate(templateInvocation, frame):
-    """
-    Expands template invocation.
-    :see braceSubstitution at
-    https://doc.wikimedia.org/mediawiki-core/master/php/html/Parser_8php_source.html#3397:
-    """
-
-    #logging.info('INVOCATION ' + templateInvocation) # DEBUG
-    parts = splitParameters(templateInvocation)
-    # part1 is the portion before the first |
-    part1 = expandTemplates(parts[0].strip(), frame)
-
-    # SUBST
-    if re.match(substWords, part1):
-        if part1.startswith('subst'):
-            return templateInvocation
-        part1 = re.sub(substWords, '', part1)
-
-    if part1.lower() in magicWords:
-        if part1 == '!':
-            return '|'
-        return ''               # FIXME: get variable value
-
-    # Parser functions
-    # The first argument is everything after the first colon.
-    colon = part1.find(':')
-    if colon > 1:
-        funct = part1[:colon]
-        parts[0] = part1[colon+1:].strip() # side-effect (parts[0] not used later)
-        ret = callParserFunction(funct, parts, frame)
-        if ret is not None:
-            return ret
-
-    title = fullyQualifiedTemplateTitle(part1)
-
-    redirected = redirects.get(title)
-    if redirected:
-        title = redirected
-
-    if title in templates:
-        # Perform parameter substitution
-
-        template = templates[title]
-        #logging.info('TEMPLATE ' + template) # DEBUG
-
-        # A parameter reference ( {{{...}}} ) may contain other parameters
-        # as well as templates, e.g.:
-        #  {{{text|{{{quote|{{{1|{{error|Error: No text given}}}}}}}}}}}
-        # hence no simple RE like this would work:
-        # '{{{((?:(?!{{{).)*?)}}}'
-        # We must use full CF parsing.
-
-        # the parameter name itself might be computed, e.g.:
-        # {{{appointe{{#if:{{{appointer14|}}}|r|d}}14|}}}
-
-        # Because of the multiple uses of double-brace and triple-brace
-        # syntax, expressions can sometimes be ambiguous. It may be helpful or
-        # necessary to include spaces to resolve such ambiguity, for example
-        # by writing {{ {{{xxx}}} }} or {{{ {{xxx}} }}}, rather than typing
-        # five consecutive braces.
-        # :see: https://en.wikipedia.org/wiki/Help:Template#Handling_parameters
-
-        params = templateParams(parts[1:])
-
-        # We perform substitution iteratively.
-        # We also limit the maximum number of iterations to avoid too long or
-        # even endless loops (in case of malformed input).
-
-        for i in xrange(maxParameterRecursionLevels):
-            result = ''
-            start = 0
-            n = 0               # no. of matches
-            # we must include '{{' in search or else
-            # {{{1|{{PAGENAME}}} would match
-            # we must handle 5 {'s as in:
-            # {{#if:{{{{{#if:{{{nominee|}}}|nominee|candidate}}|}}}|
-            for s,e in findBalanced(template, ['{{{', '{{'], ['}}}', '}}'],
-                                    ['(?<!{){{{', '{{'], 0):
-                result += template[start:s] + substParameter(template[s+3:e-3],
-                                                             params)
-                start = e
-                n += 1
-            if n == 0:          # no match
-                break
-            result += template[start:]                     # leftover
-            template = result
-        else:
-            logging.warn('Reachead maximum parameter recursions: '
-                         + str(maxParameterRecursionLevels))
-        l = len(frame)
-        if l < maxTemplateRecursionLevels:
-            #logging.info('instantiated ' + str(l) + ' ' + template) # DEBUG
-            frame.append((title, params))
-            ret =  expandTemplates(template, frame)
-            frame.pop()
-            return ret
-        else:
-            logging.warn('Reached max template recursion: '
-                         + str(maxTemplateRecursionLevels))
-            return template
-
-    else:
-        # The page being included could not be identified
-        return ""
-
-def substParameter(parameter, templateParams):
-
-    # the parameter name itself might contain parameters, e.g.:
-    # appointe{{#if:{{{appointer14|}}}|r|d}}14|
-
-    if '{{{' in parameter:
-        subst = ''
-        start = 0
-        for s,e in findMatchingBraces(parameter, '(?<!{){{{(?!{)', 3):
-            subst += parameter[start:s] + substParameter(parameter[s+3:e-3],
-                                                         templateParams)
-            start = e
-        parameter = subst + parameter[start:]
-
-    if '{{' in parameter:
-        # FIXME: pass frame to limit recursion
-        parameter = expandTemplates(parameter)
-
-    m = re.match('([^|]*)\|(.*)', parameter, flags=re.DOTALL)
-    if m:
-        # This parameter has a default value
-        paramName = m.group(1)
-        defaultValue = m.group(2)
-
-        if paramName in templateParams:
-            return templateParams[paramName]  # use parameter value specified in template invocation
-        else: # use the default value
-            return defaultValue
-    # parameter without a default value
-    elif parameter in templateParams:
-        return templateParams[parameter]  # use parameter value specified in template invocation
-    else:
-        # Parameter not specified in template invocation and does not
-        # have a default value.
-        # The Wiki rules for templates
-        # (see http://meta.wikimedia.org/wiki/Help:Template)
-        # would require to keep the parameter in 3 braces, but in our
-        # case we drop them.
-        return ''
-    # Surplus parameters - i.e., those assigned values in template
-    # invocation but not used in the template body - are simply
-    # ignored.
+# parser functions utilities
 
 def ucfirst(string):
     """:return: a string with its first character uppercase"""
@@ -839,20 +1099,47 @@ def normalizeNamespace(ns):
     return ucfirst(ns)
 
 # ----------------------------------------------------------------------
+# Parser functions
 # see http://www.mediawiki.org/wiki/Help:Extension:ParserFunctions
 # https://github.com/Wikia/app/blob/dev/extensions/ParserFunctions/ParserFunctions_body.php
 
+class Infix:
+    """Infix operators.
+    The calling sequence for the infix is:
+      x |op| y
+    """
+    def __init__(self, function):
+        self.function = function
+    def __ror__(self, other):
+        return Infix(lambda x, self=self, other=other: self.function(other, x))
+    def __or__(self, other):
+        return self.function(other)
+    def __rlshift__(self, other):
+        return Infix(lambda x, self=self, other=other: self.function(other, x))
+    def __rshift__(self, other):
+        return self.function(other)
+    def __call__(self, value1, value2):
+        return self.function(value1, value2)
+
+ROUND = Infix(lambda x,y: round(x, y))
+
 def sharp_expr(expr):
     try:
+        expr = re.sub('=', '==', expr)
         expr = re.sub('mod', '%', expr)
-        return str(eval(expr))
+        expr = re.sub('\bdiv\b', '/', expr)
+        expr = re.sub('\bround\b', '|ROUND|', expr)
+        return unicode(eval(expr))
     except:
-        return ""
+        return '<span class="error"></span>'
+
 
 def sharp_if(testValue, valueIfTrue, valueIfFalse=None, *args):
+    # In theory, we should evaluate the first argument here,
+    # but it was evaluated while evaluating part[0] in expandTemplate().
     if testValue.strip():
         # The {{#if:}} function is an if-then-else construct.
-        # The applied condition is: "The condition string is non-empty". 
+        # The applied condition is: "The condition string is non-empty".
         valueIfTrue = valueIfTrue.strip()
         if valueIfTrue:
             return valueIfTrue
@@ -885,59 +1172,67 @@ def sharp_iferror(test, then='', Else=None, *args):
     else:
         return Else.strip()
 
-def sharp_switch(primary, *templateParams):
+def sharp_switch(primary, *params):
     # FIXME: we don't support numeric expressions in primary
 
     # {{#switch: comparison string
     #  | case1 = result1
-    #  | case2 
+    #  | case2
     #  | case4 = result2
-    #  | #default = result3
+    #  | 1 | case5 = result3
+    #  | #default = result4
     # }}
 
     primary = primary.strip()
-    found = False
+    found = False               # for fall through cases
     default = None
     rvalue = None
     lvalue = ''
-    for param in templateParams:
-        pair = splitParameters(param, '=')
+    for param in params:
+        # handle cases like:
+        #  #default = [http://www.perseus.tufts.edu/hopper/text?doc=Perseus...]
+        pair = param.split('=', 1)
         lvalue = pair[0].strip()
         rvalue = None
         if len(pair) > 1:
             # got "="
             rvalue = pair[1].strip()
-            if found or lvalue == primary:
+            # check for any of multiple values pipe separated
+            if found or primary in [v.strip() for v in lvalue.split('|')]:
                 # Found a match, return now
-                return rvalue.strip()
-            elif lvalue.startswith('#default'):
+                return rvalue
+            elif lvalue == '#default':
                 default = rvalue
-                # else wrong case, continue
+            rvalue = None   # avoid defaulting to last case
         elif lvalue == primary:
             # If the value matches, set a flag and continue
             found = True
     # Default case
     # Check if the last item had no = sign, thus specifying the default case
-    if not rvalue:
+    if rvalue is not None:
         return lvalue
-    elif default:
+    elif default is not None:
         return default
     return ''
 
+# Extension Scribuntu
 def sharp_invoke(module, function, frame):
     functions = modules.get(module)
     if functions:
         funct = functions.get(function)
         if funct:
-            templateTitle = fullyQualifiedTemplateTitle(function)
             # find parameters in frame whose title is the one of the original
             # template invocation
+            templateTitle = fullyQualifiedTemplateTitle(function)
             pair = next((x for x in frame if x[0] == templateTitle), None)
             if pair:
-                return funct(*pair[1].values())
+                params = pair[1]
+                # extract positional args
+                params = [params.get(str(i+1)) for i in range(len(params))]
+                return funct(*params)
             else:
                 return funct()
-    return None
+    return ''
 
 parserFunctions = {
 
@@ -969,15 +1264,15 @@ parserFunctions = {
     # http://meta.wikimedia.org/wiki/Help:URL
     'urlencode': lambda string, *rest: urllib.quote(string.encode('utf-8')),
 
-    'lc': lambda string: string.lower() if string else '',
+    'lc': lambda string, *rest: string.lower() if string else '',
 
-    'lcfirst': lambda string: lcfirst(string),
+    'lcfirst': lambda string, *rest: lcfirst(string),
 
-    'lc': lambda string: string.upper() if string else '',
+    'uc': lambda string, *rest: string.upper() if string else '',
 
-    'ucfirst': lambda string: ucfirst(string),
+    'ucfirst': lambda string, *rest: ucfirst(string),
 
-    'int': lambda  string: string,
+    'int': lambda  string, *rest: str(int(string)),
 
 }
 
@@ -985,18 +1280,23 @@ def callParserFunction(functionName, args, frame):
     """
     Parser functions have similar syntax as templates, except that
     the first argument is everything after the first colon.
+    :return: the result of the invocation, None in case of failure.
 
     http://meta.wikimedia.org/wiki/Help:ParserFunctions
     """
-  
+
     try:
        if functionName == '#invoke':
            # special handling of frame
-           return sharp_invoke(args[0].strip(), args[1].strip(), frame)
+           ret = sharp_invoke(args[0].strip(), args[1].strip(), frame)
+           logging.debug('parserFunction> %s %s', functionName, ret)
+           return ret
        if functionName in parserFunctions:
-           return parserFunctions[functionName](*args)
+           ret = parserFunctions[functionName](*args)
+           logging.debug('parserFunction> %s %s', functionName, ret)
+           return ret
     except:
-        return None             # FIXME: fix errors
+        return ""             # FIXME: fix errors
 
     return ""
 
@@ -1007,7 +1307,7 @@ def callParserFunction(functionName, args, frame):
 # def expandTemplates(text):
 #     """Expand templates invoking MediaWiki API"""
 #     text = urlib.urlencodew(text.encode('utf-8'))
-#     base = prefix[:prefix.rfind('/')]
+#     base = urlbase[:urlbase.rfind('/')]
 #     url = base + "/w/api.php?action=expandtemplates&format=json&text=" + text
 #     exp = json.loads(urllib.urlopen(url))
 #     return exp['expandtemplates']['*']
@@ -1020,8 +1320,14 @@ reIncludeonly = re.compile(r'<includeonly>|</includeonly>', re.DOTALL)
 
 templates = {}
 redirects = {}
+# cache of parser templates
+templateCache = {}
 
 def define_template(title, page):
+    """
+    Adds a template defined in the :param page:.
+    @see https://en.wikipedia.org/wiki/Help:Template#Noinclude.2C_includeonly.2C_and_onlyinclude
+    """
     global templates
     global redirects
 
@@ -1047,23 +1353,23 @@ def define_template(title, page):
     # remove comments
     text = comment.sub('', text)
 
+    # eliminate <noinclude> fragments
+    text = reNoinclude.sub('', text)
+    # eliminate unterminated <noinclude> elements
+    text = re.sub(r'<noinclude\s*>.*$', '', text, flags=re.DOTALL)
+    text = re.sub(r'<noinclude/>', '', text)
+
     onlyincludeAccumulator = ''
     for m in re.finditer('<onlyinclude>(.*?)</onlyinclude>', text, re.DOTALL):
-        onlyincludeAccumulator += m.group(1) + "\n"
+        onlyincludeAccumulator += m.group(1)
     if onlyincludeAccumulator:
         text = onlyincludeAccumulator
     else:
-        # If there are no <onlyinclude> fragments, simply eliminate
-        # <noinclude> fragments and keep <includeonly> ones.
-        text = reNoinclude.sub('', text)
-        # eliminate unterminated <noinclude> elements
-        text = re.sub(r'<noinclude\s*>.*$', '', text, flags=re.DOTALL)
-
         text = reIncludeonly.sub('', text)
 
     if text:
         if title in templates:
-            logging.warn('Redefining: ' + title)
+            logging.warn('Redefining: %s', title)
         templates[title] = text
 
 # ----------------------------------------------------------------------
@@ -1135,79 +1441,468 @@ def dropSpans(spans, text):
     res += text[offset:]
     return res
 
-# Match interwiki links, | separates parameters.
-# First parameter is displayed, also trailing concatenated text included
-# in display, e.g. s for plural).
-#
-# Can be nested [[File:..|..[[..]]..|..]], [[Category:...]], etc.
-# We first expand inner ones, than remove enclosing ones.
-#
-wikiLink = re.compile(r'\[\[([^[]*?)(?:\|([^[]*?))?\]\](\w*)')
+# ----------------------------------------------------------------------
+# WikiLinks
+# See https://www.mediawiki.org/wiki/Help:Links#Internal_links
 
-parametrizedLink = re.compile(r'\[\[[^\]]*?\]\]')
+# Can be nested [[File:..|..[[..]]..|..]], [[Category:...]], etc.
+# Also: [[Help:IPA for Catalan|[andora]]]
+
+def replaceInternalLinks(text):
+    """
+    Replaces external links of the form:
+    [[title |...|label]]trail
+
+    with title concatenated with trail, when present, e.g. 's' for plural.
+    """
+    # call this after removal of external links, so we need not worry about
+    # triple closing ]]].
+    cur = 0
+    res = ''
+    for s,e in findBalanced(text, ['[['], [']]']):
+        m = tailRE.match(text, e)
+        if m:
+            trail = m.group(0)
+            end = m.end()
+        else:
+            trail = ''
+            end = e
+        inner = text[s+2:e-2]
+        # find first |
+        pipe = inner.find('|')
+        if pipe < 0:
+            title = inner
+            label = title
+        else:
+            title = inner[:pipe].rstrip()
+            # find last |
+            curp = pipe+1
+            for s1,e1 in findBalanced(inner, ['[['], [']]']):
+                last = inner.rfind('|', curp, s1)
+                if last >= 0:
+                    pipe = last # advance
+                curp = e1
+            label = inner[pipe+1:].strip()
+        res += text[cur:s] + makeInternalLink(title, label) + trail
+        cur = end
+    return res + text[cur:]
+
+# the official version is a method in class Parser, similar to this:
+# def replaceInternalLinks2(text):
+#     global wgExtraInterlanguageLinkPrefixes
+ 
+#     # the % is needed to support urlencoded titles as well
+#     tc = Title::legalChars() + '#%'
+#     # Match a link having the form [[namespace:link|alternate]]trail
+#     e1 = re.compile("([%s]+)(?:\\|(.+?))?]](.*)" % tc, re.S | re.D)
+#     # Match cases where there is no "]]", which might still be images
+#     e1_img = re.compile("([%s]+)\\|(.*)" % tc, re.S | re.D)
+ 
+#     holders = LinkHolderArray(self)
+ 
+#     # split the entire text string on occurrences of [[
+#     iterBrackets = re.compile('[[').finditer(text)
+
+#     m in iterBrackets.next()
+#     # get the first element (all text up to first [[)
+#     s = text[:m.start()]
+#     cur = m.end()
+
+#     line = s
+ 
+#     useLinkPrefixExtension = self.getTargetLanguage().linkPrefixExtension()
+#     e2 = None
+#     if useLinkPrefixExtension:
+#         # Match the end of a line for a word that is not followed by whitespace,
+#         # e.g. in the case of "The Arab al[[Razi]]",  "al" will be matched
+#         global wgContLang
+#         charset = wgContLang.linkPrefixCharset()
+#         e2 = re.compile("((?>.*[^charset]|))(.+)", re.S | re.D | re.U)
+
+#     if self.mTitle is None:
+#         raise MWException(__METHOD__ + ": \self.mTitle is null\n")
+
+#     nottalk = not self.mTitle.isTalkPage()
+
+#     if useLinkPrefixExtension:
+#         m = e2.match(s)
+#         if m:
+#             first_prefix = m.group(2)
+#         else:
+#             first_prefix = false
+#     else:
+#         prefix = ''
+
+#     useSubpages = self.areSubpagesAllowed()
+ 
+#     for m in iterBrackets:
+#         line = text[cur:m.start()]
+#         cur = m.end()
+
+#         # TODO: Check for excessive memory usage
+
+#         if useLinkPrefixExtension:
+#             m = e2.match(e2)
+#             if m:
+#                 prefix = m.group(2)
+#                 s = m.group(1)
+#             else:
+#                 prefix = ''
+#             # first link
+#             if first_prefix:
+#                 prefix = first_prefix
+#                 first_prefix = False
+ 
+#         might_be_img = False
+ 
+#         m = e1.match(line)
+#         if m: # page with normal label or alt
+#             label = m.group(2)
+#             # If we get a ] at the beginning of m.group(3) that means we have a link that is something like:
+#             # [[Image:Foo.jpg|[http://example.com desc]]] <- having three ] in a row fucks up,
+#             # the real problem is with the e1 regex
+#             # See bug 1300.
+#             #
+#             # Still some problems for cases where the ] is meant to be outside punctuation,
+#             # and no image is in sight. See bug 2095.
+#             #
+#             if label and m.group(3)[0] == ']' and '[' in label:
+#                 label += ']' # so that replaceExternalLinks(label) works later
+#                 m.group(3) = m.group(3)[1:]
+#             # fix up urlencoded title texts
+#             if '%' in m.group(1):
+#                 # Should anchors '#' also be rejected?
+#                 m.group(1) = str_replace(array('<', '>'), array('&lt', '&gt'), rawurldecode(m.group(1)))
+#             trail = m.group(3)
+#         else:
+#             m = e1_img.match(line):
+#             if m:
+#                 # Invalid, but might be an image with a link in its caption
+#                 might_be_img = true
+#                 label = m.group(2)
+#                 if '%' in m.group(1):
+#                     m.group(1) = rawurldecode(m.group(1))
+#                 trail = ""
+#             else:		# Invalid form; output directly
+#                 s += prefix + '[[' + line
+#                 continue
+
+#         origLink = m.group(1)
+
+#         # Dont allow internal links to pages containing
+#         # PROTO: where PROTO is a valid URL protocol these
+#         # should be external links.
+#         if (preg_match('/^(?i:' + self.mUrlProtocols + ')/', origLink)) {
+#             s += prefix + '[[' + line
+#             continue
+#         }
+
+#         # Make subpage if necessary
+#         if useSubpages:
+#             link = self.maybeDoSubpageLink(origLink, label)
+#         else:
+#             link = origLink
+
+#         noforce = origLink[0] != ':'
+#         if not noforce:
+#             # Strip off leading ':'
+#             link = link[1:]
+
+#         nt = Title::newFromText(self.mStripState.unstripNoWiki(link))
+#         if nt is None:
+#             s += prefix + '[[' + line
+#             continue
+
+#         ns = nt.getNamespace()
+#         iw = nt.getInterwiki()
+
+#         if might_be_img {	# if this is actually an invalid link
+#             if (ns == NS_FILE and noforce) { # but might be an image
+#                 found = False
+#                 while True:
+#                     # look at the next 'line' to see if we can close it there
+#                     next_line = iterBrakets.next()
+#                     if not next_line:
+#                         break
+#                     m = explode(']]', next_line, 3)
+#                     if m.lastindex == 3:
+#                         # the first ]] closes the inner link, the second the image
+#                         found = True
+#                         label += "[[%s]]%s" % (m.group(0), m.group(1))
+#                         trail = m.group(2)
+#                         break
+#                     elif m.lastindex == 2:
+#                         # if there is exactly one ]] that is fine, we will keep looking
+#                         label += "[[{m[0]}]]{m.group(1)}"
+#                     else:
+#                         # if next_line is invalid too, we need look no further
+#                         label += '[[' + next_line
+#                         break
+#                 if not found:
+#                     # we couldnt find the end of this imageLink, so output it raw
+#                     # but dont ignore what might be perfectly normal links in the text we ve examined
+#                     holders.merge(self.replaceInternalLinks2(label))
+#                     s += "{prefix}[[%s|%s" % (link, text)
+#                     # note: no trail, because without an end, there *is* no trail
+#                     continue
+#             } else: # it is not an image, so output it raw
+#                 s += "{prefix}[[%s|%s" % (link, text)
+#                 # note: no trail, because without an end, there *is* no trail
+#                      continue
+#         }
+ 
+#         wasblank = (text == '')
+#         if wasblank:
+#             text = link
+#         else:
+#             # Bug 4598 madness.  Handle the quotes only if they come from the alternate part
+#             # [[Lista d''e paise d''o munno]] . <a href="...">Lista d''e paise d''o munno</a>
+#             # [[Criticism of Harry Potter|Criticism of ''Harry Potter'']]
+#             #    . <a href="Criticism of Harry Potter">Criticism of <i>Harry Potter</i></a>
+#             text = self.doQuotes(text)
+
+#         # Link not escaped by : , create the various objects
+#         if noforce and not nt.wasLocalInterwiki():
+#             # Interwikis
+#             if iw and mOptions.getInterwikiMagic() and nottalk and (
+#                     Language::fetchLanguageName(iw, None, 'mw') or
+#                     in_array(iw, wgExtraInterlanguageLinkPrefixes)):
+#                 # Bug 24502: filter duplicates
+#                 if iw not in mLangLinkLanguages:
+#                     self.mLangLinkLanguages[iw] = True
+#                     self.mOutput.addLanguageLink(nt.getFullText())
+
+#                 s = rstrip(s + prefix)
+#                 s += strip(trail, "\n") == '' ? '': prefix + trail
+#                 continue
+
+#             if ns == NS_FILE:
+#                 if not wfIsBadImage(nt.getDBkey(), self.mTitle):
+#                     if wasblank:
+#                         # if no parameters were passed, text
+#                         # becomes something like "File:Foo.png",
+#                         # which we dont want to pass on to the
+#                         # image generator
+#                         text = ''
+#                     else:
+#                         # recursively parse links inside the image caption
+#                         # actually, this will parse them in any other parameters, too,
+#                         # but it might be hard to fix that, and it doesnt matter ATM
+#                         text = self.replaceExternalLinks(text)
+#                         holders.merge(self.replaceInternalLinks2(text))
+#                     # cloak any absolute URLs inside the image markup, so replaceExternalLinks() wont touch them
+#                     s += prefix + self.armorLinks(
+#                         self.makeImage(nt, text, holders)) + trail
+#                 else:
+#                     s += prefix + trail
+#                 continue
+ 
+#             if ns == NS_CATEGORY:
+#                 s = rstrip(s + "\n") # bug 87
+
+#                 if wasblank:
+#                     sortkey = self.getDefaultSort()
+#                 else:
+#                     sortkey = text
+#                 sortkey = Sanitizer::decodeCharReferences(sortkey)
+#                 sortkey = str_replace("\n", '', sortkey)
+#                 sortkey = self.getConverterLanguage().convertCategoryKey(sortkey)
+#                 self.mOutput.addCategory(nt.getDBkey(), sortkey)
+
+#                 s += strip(prefix + trail, "\n") == '' ? '' : prefix + trail
+
+#                 continue
+#             }
+#         }
+
+#         # Self-link checking. For some languages, variants of the title are checked in
+#         # LinkHolderArray::doVariants() to allow batching the existence checks necessary
+#         # for linking to a different variant.
+#         if ns != NS_SPECIAL and nt.equals(self.mTitle) and !nt.hasFragment():
+#             s += prefix + Linker::makeSelfLinkObj(nt, text, '', trail)
+#                  continue
+ 
+#         # NS_MEDIA is a pseudo-namespace for linking directly to a file
+#         # @todo FIXME: Should do batch file existence checks, see comment below
+#         if ns == NS_MEDIA:
+#             # Give extensions a chance to select the file revision for us
+#             options = []
+#             descQuery = False
+#             Hooks::run('BeforeParserFetchFileAndTitle',
+#                        [this, nt, &options, &descQuery])
+#             # Fetch and register the file (file title may be different via hooks)
+#             file, nt = self.fetchFileAndTitle(nt, options)
+#             # Cloak with NOPARSE to avoid replacement in replaceExternalLinks
+#             s += prefix + self.armorLinks(
+#                 Linker::makeMediaLinkFile(nt, file, text)) + trail
+#             continue
+
+#         # Some titles, such as valid special pages or files in foreign repos, should
+#         # be shown as bluelinks even though they are not included in the page table
+#         #
+#         # @todo FIXME: isAlwaysKnown() can be expensive for file links; we should really do
+#         # batch file existence checks for NS_FILE and NS_MEDIA
+#         if iw == '' and nt.isAlwaysKnown():
+#             self.mOutput.addLink(nt)
+#             s += self.makeKnownLinkHolder(nt, text, array(), trail, prefix)
+#         else:
+#             # Links will be added to the output link list after checking
+#             s += holders.makeHolder(nt, text, array(), trail, prefix)
+#     }
+#     return holders
+
+def makeInternalLink(title, label):
+    colon = title.find(':')
+    if colon > 0 and title[:colon] not in acceptedNamespaces:
+        return ''
+    if colon == 0:
+        # drop also :File:
+        colon2 = title.find(':', colon+1)
+        if colon2 > 1 and title[colon+1:colon2] not in acceptedNamespaces:
+            return ''
+    if Extractor.keepLinks:
+        return '<a href="%s">%s</a>' % (urllib.quote(title.encode('utf-8')), anchor)
+    else:
+        return label
+
+# ----------------------------------------------------------------------
+# External links
+
+# from: https://doc.wikimedia.org/mediawiki-core/master/php/DefaultSettings_8php_source.html
+
+wgUrlProtocols = [
+     'bitcoin:', 'ftp://', 'ftps://', 'geo:', 'git://', 'gopher://', 'http://',
+     'https://', 'irc://', 'ircs://', 'magnet:', 'mailto:', 'mms://', 'news:',
+     'nntp://', 'redis://', 'sftp://', 'sip:', 'sips:', 'sms:', 'ssh://',
+     'svn://', 'tel:', 'telnet://', 'urn:', 'worldwind://', 'xmpp:', '//'
+]
+
+# from: https://doc.wikimedia.org/mediawiki-core/master/php/Parser_8php_source.html
+
+# Constants needed for external link processing
+# Everything except bracket, space, or control characters
+# \p{Zs} is unicode 'separator, space' category. It covers the space 0x20
+# as well as U+3000 is IDEOGRAPHIC SPACE for bug 19052
+EXT_LINK_URL_CLASS = r'[^][<>"\x00-\x20\x7F\s]'
+ExtLinkBracketedRegex = re.compile('\[(((?i)' + '|'.join(wgUrlProtocols) + ')' + EXT_LINK_URL_CLASS + r'+)\s*([^\]\x00-\x08\x0a-\x1F]*?)\]', re.S | re.U)
+EXT_IMAGE_REGEX = re.compile(
+    r"""^(http://|https://)([^][<>"\x00-\x20\x7F\s]+)
+    /([A-Za-z0-9_.,~%\-+&;#*?!=()@\x80-\xFF]+)\.((?i)gif|png|jpg|jpeg)$""",
+    re.X | re.S | re.U)
+
+def replaceExternalLinks(text):
+    s = ''
+    cur = 0
+    for m in ExtLinkBracketedRegex.finditer(text):
+        s += text[cur:m.start()]
+        cur = m.end()
+
+        url = m.group(1)
+        label = m.group(3)
+ 
+        # # The characters '<' and '>' (which were escaped by
+        # # removeHTMLtags()) should not be included in
+        # # URLs, per RFC 2396.
+        # m2 = re.search('&(lt|gt);', url)
+        # if m2:
+        #     link = url[m2.end():] + ' ' + link
+        #     url = url[0:m2.end()]
+ 
+        # If the link text is an image URL, replace it with an <img> tag
+        # This happened by accident in the original parser, but some people used it extensively
+        m = EXT_IMAGE_REGEX.match(label)
+        if m:
+            label = makeExternalImage(label)
+ 
+        # Use the encoded URL
+        # This means that users can paste URLs directly into the text
+        # Funny characters like Ã¶ aren't valid in URLs anyway
+        # This was changed in August 2004
+        s += makeExternalLink(url, label) #+ trail
+ 
+    return s + text[cur:]
 
 # Function applied to wikiLinks
-def make_anchor_tag(match):
-    global keepLinks
-    link = match.group(1)
-    colon = link.find(':')
-    if colon > 0 and link[:colon] not in acceptedNamespaces:
+def makeExternalLink(title, anchor):
+    colon = title.find(':')
+    if colon > 0 and title[:colon] not in acceptedNamespaces:
         return ''
-    trail = match.group(3)
-    anchor = match.group(2)
-    if not anchor:
-        anchor = link
-    anchor += trail
-    if keepLinks:
-        return '<a href="%s">%s</a>' % (link, anchor)
+    if colon == 0:
+        # drop also :File:
+        colon2 = title.find(':', colon+1)
+        if colon2 > 1 and title[colon+1:colon2] not in acceptedNamespaces:
+            return ''
+    if Extractor.keepLinks:
+        return '<a href="%s">%s</a>' % (urllib.quote(title.encode('utf-8')), anchor)
     else:
         return anchor
 
+def makeExternalImage(url, alt=''):
+    if Extractor.keepLinks:
+        return '<img src="%s" alt="%s">' % (url, alt)
+    else:
+        return alt
+
+
 # ----------------------------------------------------------------------
 
-def clean(text):
+# match tail after wikilink
+tailRE = re.compile('\w+')
 
-    # expand templates
-    # See: http://www.mediawiki.org/wiki/Help:Templates
-    text = expandTemplates(text)
+syntaxhighlight = re.compile('&lt;syntaxhighlight .*?&gt;(.*?)&lt;/syntaxhighlight&gt;', re.DOTALL)
 
-    # Drop transclusions (template, parser functions)
-    text = dropNested(text, r'{{', r'}}')
+expand_templates = True
+
+def clean(extractor, text):
+    """
+    Transforms wiki markup.
+    @see https://www.mediawiki.org/wiki/Help:Formatting
+    """
+
+    if (expand_templates):
+        # expand templates
+        # See: http://www.mediawiki.org/wiki/Help:Templates
+        text = extractor.expandTemplates(text)
+    else:
+        # Drop transclusions (template, parser functions)
+        text = dropNested(text, r'{{', r'}}')
 
     # Drop tables
     text = dropNested(text, r'{\|', r'\|}')
 
-    # Drop preformatted
-    # Done after dropping transclusions (since {{Cite ..}} are often indented)
-    # but before dropping links, since they might leave a space in front
-    # of a line, e.g. "[[File: something]] Rest..." => " Rest..."
+    # replace external links
+    text = replaceExternalLinks(text)
 
-    text = preformatted.sub('', text)
+    # replace internal links
+    text = replaceInternalLinks(text)
 
-    # Expand links
-    text = wikiLink.sub(make_anchor_tag, text)
-    # Drop all remaining ones
-    text = parametrizedLink.sub('', text)
-
-    # Handle external links
-    text = externalLink.sub(r'\1', text)
-    text = externalLinkNoAnchor.sub('', text)
-
-    # Handle bold/italic/quote
-    text = bold_italic.sub(r'\1', text)
-    text = bold.sub(r'\1', text)
-    text = italic_quote.sub(r'&quot;\1&quot;', text)
-    text = italic.sub(r'&quot;\1&quot;', text)
-    text = quote_quote.sub(r'\1', text)
-    # residuals of unbalanced quotes
-    text = text.replace("'''", '').replace("''", '&quot;')
+    # drop MagicWords behavioral switches
+    text = magicWordsRE.sub('', text)
 
     ################ Process HTML ###############
 
-    # turn into HTML
-    text = unescape(text)
-    # do it again (&amp;nbsp;)
-    text = unescape(text)
+    # turn into HTML, except for the content of <syntaxhighlight>
+    res = ''
+    cur = 0
+    for m in syntaxhighlight.finditer(text):
+        end = m.end()
+        res += unescape(text[cur:m.start()]) + m.group(1)
+        cur = end
+    text = res + unescape(text[cur:])
+
+    # Handle bold/italic/quote
+    if extractor.toHTML:
+        text = bold_italic.sub(r'<b>\1</b>', text)
+        text = bold.sub(r'<b>\1</b>', text)
+        text = italic.sub(r'<i>\1</i>', text)
+    else:
+        text = bold_italic.sub(r'\1', text)
+        text = bold.sub(r'\1', text)
+        text = italic_quote.sub(r'"\1"', text)
+        text = italic.sub(r'"\1"', text)
+        text = quote_quote.sub(r'"\1"', text)
+    # residuals of unbalanced quotes
+    text = text.replace("'''", '').replace("''", '"')
 
     # Collect spans
 
@@ -1232,15 +1927,12 @@ def clean(text):
     text = dropSpans(spans, text)
 
     # Drop discarded elements
-    start = []
-    end = []
-    for pattern in discard_element_patterns:
-        for m in pattern.finditer(text):
-            start.append(m.start())
-            end.append(m.end())
-    # bulk removal
-    spans = [p for p in izip(start, end)]
-    text = dropSpans(spans, text)
+    for tag in discardElements:
+        text = dropNested(text, r'<\s*%s\b[^>/]*>' % tag, r'<\s*/\s*%s>' % tag)
+
+    if not extractor.toHTML:
+        # Turn into text what is left (&amp;nbsp;) and <syntaxhighlight>
+        text = unescape(text)
 
     # Expand placeholders
     for pattern, placeholder in placeholder_tag_patterns:
@@ -1259,18 +1951,28 @@ def clean(text):
     text = dots.sub('...', text)
     text = re.sub(u' (,:\.\)\]Â»)', r'\1', text)
     text = re.sub(u'(\[\(Â«) ', r'\1', text)
-    text = re.sub(r'\n\W+?\n', '\n', text) # lines with only punctuations
+    text = re.sub(r'\n\W+?\n', '\n', text, flags=re.U) # lines with only punctuations
     text = text.replace(',,', ',').replace(',.', '.')
+
     return text
 
+# skip level 1, it is page name level
 section = re.compile(r'(==+)\s*(.*?)\s*\1')
 
+listOpen = { '*': '<ul>', '#': '<ol>', ';': '<dl>', ':': '<dl>' }
+listClose = { '*': '</ul>', '#': '</ol>', ';': '</dl>', ':': '</dl>' }
+listItem = { '*': '<li>%s</li>', '#': '<li>%s</<li>', ';': '<dt>%s</dt>',
+             ':': '<dd>%s</dd>' }
+
 def compact(text):
-    """Deal with headers, lists, empty sections, residuals of tables"""
+    """Deal with headers, lists, empty sections, residuals of tables.
+    :param toHTML: convert to HTML
+    """
+
     page = []                   # list of paragraph
     headers = {}                # Headers for unfilled sections
     emptySection = False        # empty sections are discarded
-    inList = False              # whether opened <UL>
+    listLevel = ''              # nesting of lists
 
     for line in text.split('\n'):
 
@@ -1281,7 +1983,7 @@ def compact(text):
         if m:
             title = m.group(2)
             lev = len(m.group(1))
-            if keepSections:
+            if Extractor.toHTML:
                 page.append("<h%d>%s</h%d>" % (lev, title, lev))
             if title and title[-1] not in '!?':
                 title += '.'
@@ -1301,29 +2003,60 @@ def compact(text):
                 page.append(title)
         # handle indents
         elif line[0] == ':':
-            page.append(line[1:])
+            #page.append(line.lstrip(':*#;'))
+            continue
         # handle lists
-        elif line[0] in '*#;':
-            if keepSections:
-                page.append("<li>%s</li>" % line[1:])
+        elif line[0] in '*#;:':
+            if Extractor.toHTML:
+                i = 0
+                for c,n in izip_longest(listLevel, line):
+                    if n not in '*#;:':
+                        if c:
+                            page.append(listClose[c])
+                            listLevel = listLevel[:-1]
+                            continue
+                        else:
+                            break
+                    if c != n and (not c or (c not in ';:' and n not in ';:')):
+                        if c:
+                            # close level
+                            page.append(listClose[c])
+                            listLevel = listLevel[:-1]
+                        listLevel = listLevel + n
+                        page.append(listOpen[n])
+                    i += 1
+                n = line[i-1]
+                line = line[i:].strip()
+                if line:
+                    page.append(listItem[n] % line)
             else:
                 continue
+        elif len(listLevel):
+            for c in reversed(listLevel):
+                page.append(listClose[c])
+            listLevel = []
+
         # Drop residuals of lists
-        elif line[0] in '{|' or line[-1] in '}':
+        elif line[0] in '{|' or line[-1] == '}':
             continue
         # Drop irrelevant lines
         elif (line[0] == '(' and line[-1] == ')') or line.strip('.-') == '':
             continue
         elif len(headers):
-            items = headers.items()
-            items.sort()
-            for (i, v) in items:
-                page.append(v)
+            if not Extractor.keepSections:
+                items = headers.items()
+                items.sort()
+                for (i, v) in items:
+                    page.append(v)
             headers.clear()
             page.append(line)   # first line
             emptySection = False
         elif not emptySection:
             page.append(line)
+        # dangerous
+        # # Drop preformatted
+        # elif line[0] == ' ':
+        #     continue
 
     return page
 
@@ -1333,60 +2066,79 @@ def handle_unicode(entity):
     return unichr(numeric_code)
 
 #------------------------------------------------------------------------------
+# Output
 
-class OutputSplitter:
-    def __init__(self, path_name=None, max_file_size=0, compress=True):
-        self.dir_index = 0
-        self.file_index = -1
-        self.compress = compress
-        self.max_file_size = max_file_size
+class NextFile(object):
+    """
+    Synchronous generation of next available file name.
+    """
+
+    filesPerDir = 100
+
+    def __init__(self, lock, path_name):
+        self.lock = lock
         self.path_name = path_name
-        if path_name:
-            self.out_file = self.open_next_file()
-        else:
-            self.out_file = sys.stdout
+        self.dir_index = -1
+        self.file_index = -1
 
-    def reserve(self, size):
-        if self.path_name:
-            cur_file_size = self.out_file.tell()
-            if cur_file_size + size > self.max_file_size:
-                self.close()
-                self.out_file = self.open_next_file()
+    def next(self):
+        with self.lock:
+            self.file_index = (self.file_index + 1) % NextFile.filesPerDir
+            if self.file_index == 0:
+                self.dir_index += 1
+            dirname = self._dirname()
+            if not os.path.isdir(dirname):
+                os.makedirs(dirname)
+            return self._filepath()
 
-    def write(self, text):
-        self.out_file.write(text)
-
-    def close(self):
-        self.out_file.close()
-
-    def open_next_file(self):
-        self.file_index += 1
-        if self.file_index == 100:
-            self.dir_index += 1
-            self.file_index = 0
-        dir_name = self._dir_name()
-        if not os.path.isdir(dir_name):
-            os.makedirs(dir_name)
-        file_name = os.path.join(dir_name, self._file_name())
-        if self.compress:
-            return bz2.BZ2File(file_name + '.bz2', 'w')
-        else:
-            return open(file_name, 'w')
-
-    def _dir_name(self):
+    def _dirname(self):
         char1 = self.dir_index % 26
         char2 = self.dir_index / 26 % 26
         return os.path.join(self.path_name, '%c%c' % (ord('A') + char2, ord('A') + char1))
 
-    def _file_name(self):
-        return 'wiki_%02d' % self.file_index
+    def _filepath(self):
+        return '%s/wiki_%02d' % (self._dirname(), self.file_index)
+
+class OutputSplitter(object):
+    """
+    File-like object, that splits output to multiple files of a given max size.
+    """
+
+    def __init__(self, nextFile, max_file_size=0, compress=True):
+        """
+        :param nextfile: a NextFile object from which to obtain filenames
+            to use.
+        :param max_file_size: the maximum size of each file.
+        :para compress: whether to write data with bzip compression.
+        """
+        self.nextFile = nextFile
+        self.compress = compress
+        self.max_file_size = max_file_size
+        self.file = self.open(self.nextFile.next())
+
+    def reserve(self, size):
+        if self.file.tell() + size > self.max_file_size:
+            self.close()
+            self.file = self.open(self.nextFile.next())
+
+    def write(self, data):
+        self.file.write(data)
+
+    def close(self):
+        self.file.close()
+
+    def open(self, filename):
+        if self.compress:
+            return bz2.BZ2File(filename + '.bz2', 'w')
+        else:
+            return open(filename, 'w')
 
 # ----------------------------------------------------------------------
 # READER
 
 tagRE = re.compile(r'(.*?)<(/?\w+)[^>]*>(?:([^<]*)(<.*?>)?)?')
+#                    1     2               3      4
 #tagRE = re.compile(r'(.*?)<(/?\w+)[^>]*>([^<]*)')
-#                    1     2            3
 
 def load_templates(file, output_file=None):
     """
@@ -1440,20 +2192,20 @@ def load_templates(file, output_file=None):
             page = []
             articles += 1
             if articles % 10000 == 0:
-                logging.info("Preprocessed: %d pages" % articles)
+                logging.info("Preprocessed %d pages", articles)
 
-def process_data(input_file, template_file, output):
+def process_dump(input_file, template_file, outdir, file_size, file_compress, threads):
     """
     :param input_file: name of the wikipedia dump file.
     :param template_file: optional file with template definitions.
-    :param output: name of the directory where to store extracted files.
+    :param outdir: name of the directory where to store extracted files.
+    :param file_size: max size of each extracted file.
+    :param file_compress: whether to compress files with bzip.
     """
-    global prefix
+    global urlbase
     global knownNamespaces
     global templateNamespace
-
-    # preprocess
-    logging.info("Preprocessing dump to collect template definitions: this may take some time.")
+    global expand_templates
 
     if input_file.lower().endswith("bz2"):
         opener = bz2.BZ2File
@@ -1470,10 +2222,10 @@ def process_data(input_file, template_file, output):
             continue
         tag = m.group(2)
         if tag == 'base':
-            # discover prefix from the xml dump file
+            # discover urlbase from the xml dump file
             # /mediawiki/siteinfo/base
             base = m.group(3)
-            prefix = base[:base.rfind("/")]
+            urlbase = base[:base.rfind("/")]
         elif tag == 'namespace':
             knownNamespaces.add(m.group(3))
             if re.search('key="10"', line):
@@ -1481,19 +2233,38 @@ def process_data(input_file, template_file, output):
         elif tag == '/siteinfo':
             break
 
-    if template_file and os.path.exists(template_file):
-        input.close()
-        with open(template_file) as file:
-            load_templates(file)
-    else:
-        load_templates(input, template_file)
-        input.close()
+    if expand_templates:
+        # preprocess
+        logging.info("Preprocessing dump to collect template definitions: this may take some time.")
+        if template_file and os.path.exists(template_file):
+            input.close()
+            with open(template_file) as file:
+                load_templates(file)
+        else:
+            load_templates(input, template_file)
+            input.close()
+        input = opener(input_file)
 
     # process pages
-    logging.info("Starting processing pages from %s." % input_file)
+    logging.info("Starting processing pages from %s.", input_file)
 
-    input = opener(input_file)
+    # initialize jobs queue
+    #threads = multiprocessing.cpu_count()
+    logging.info("Using %d CPUs.", threads)
+    queue = Queue.Queue(maxsize=2 * threads)
+    lock = threading.Lock()  # for protecting shared state.
 
+    nextFile = NextFile(lock, outdir)
+
+    # start worker threads
+    workers = []
+    for _ in xrange(max(1, threads - 1)): # keep one for master
+        output_splitter = OutputSplitter(nextFile, file_size, file_compress)
+        extractor = ExtractorThread(queue, output_splitter)
+        workers.append(extractor)
+
+    # we collect indivual lines, since str.join() is significantly faster than
+    # concatenation
     page = []
     id = None
     inText = False
@@ -1533,77 +2304,38 @@ def process_data(input_file, template_file, output):
             colon = title.find(':')
             if (colon < 0 or title[:colon] in acceptedNamespaces) and \
                     not redirect and not title.startswith(templateNamespace):
-                logging.info("%s\t%s" % (id, title))
-                extract(id, title, page, output)
+                queue.put(Extractor(id, title, page), True) # block if full
             id = None
             page = []
 
+    # wait for empty queue
+    queue.join()
+
     input.close()
 
-# ----------------------------------------------------------------------
+
+#----------------------------------------------------------------------
 # Multithread version
 
 class ExtractorThread(threading.Thread):
-    
-    _filename_lock = threading.RLock()    
-    
-    def __init__(self, queue, outputdir, maxfilesize, prefix, compress):
-        threading.Thread.__init__(self)
+    """
+    Extractor thread.
+    """
+    def __init__(self, queue, splitter):
         self._queue = queue
-        self._maxfilesize = maxfilesize
-        self._prefix = prefix
-        self._compress = compress
-        self._outputdir = outputdir
-        if not os.path.exists(outputdir):
-            os.mkdir(outputdir)
-        self._outfile = None
-        
-    @classmethod
-    def _get_file(cls, outputdir, compress=False):
-        with cls._filename_lock:
-            fpath = None
-            while not fpath or os.path.exists(fpath):
-                fname = ''.join([random.choice(string.letters) for _ in range(16)])
-                ext = ".txt" if not compress else ".txt.bz2"
-                fpath = os.path.join(outputdir, fname + ext)    
-                
-            if compress:
-                return bz2.BZ2File(fpath, 'w')
-                
-            return open(fpath, 'w')
-            
-    def _get_url(self, prefix, id):
-        return "%s?curid=%s" % (prefix, id)        
-    
-    def _write(self, id, title, text):
-        if not self._outfile:
-            self._outfile = self._get_file(self._outputdir, self._compress)
-        
-        logging.info(("[%s] [%s]" % (id, title)).encode('utf-8'))
-        
-        url = self._get_url(self._prefix, id)    
-        
-        header = '<doc id="%s" url="%s" title="%s">%s\n' % (id, url, title, title)
-        footer = "\n</doc>"
-        self._outfile.write(header.encode("utf-8")) 
-        for line in compact(clean(text)):
-            self._outfile.write(line.encode("utf-8"))
-        self._outfile.write(footer)        
-    
+        self._splitter = splitter
+        threading.Thread.__init__(self)
+        self.setDaemon(True)  # let the process die when main thread is killed
+        self.start()
+
     def run(self):
         while True:
-            try:
-                page = self._queue.get(timeout=1)
-                if page:
-                    self._write(page)
-            except Queue.Empty:
-                break
-            except:
-                logging.error(traceback.format_exc())
-            finally:
+            job = self._queue.get()
+            if job:
+                job.extract(self._splitter)
                 self._queue.task_done()
-                    
-        logging.info("%s done" % self.name)
+            else:
+                break
 
 # ----------------------------------------------------------------------
 
@@ -1611,68 +2343,83 @@ class ExtractorThread(threading.Thread):
 minFileSize = 200 * 1024
 
 def main():
-    global keepLinks, keepSections, prefix, acceptedNamespaces
+    global urlbase, acceptedNamespaces
+    global expand_templates
 
     parser = argparse.ArgumentParser(prog=os.path.basename(sys.argv[0]),
         formatter_class=argparse.RawDescriptionHelpFormatter,
                                      description=__doc__)
     parser.add_argument("input",
                         help="XML wiki dump file")
-    parser.add_argument("-o", "--output", default="text",
+    groupO = parser.add_argument_group('Output')
+    groupO.add_argument("-o", "--output", default="text",
                         help="output directory")
-    parser.add_argument("-b", "--bytes", default="1M",
-                        help="put specified bytes per output file (default is %(default)s)", metavar="n[KM]")
-    parser.add_argument("-B", "--base",
-                        help="base URL for the Wikipedia pages")
-    parser.add_argument("-c", "--compress", action="store_true",
+    groupO.add_argument("-b", "--bytes", default="1M",
+                        help="put specified bytes per output file (default is %(default)s)", metavar="n[KMG]")
+    groupO.add_argument("-c", "--compress", action="store_true",
                         help="compress output files using bzip")
-    parser.add_argument("-l", "--links", action="store_true",
+
+    groupP = parser.add_argument_group('Processing')
+    groupP.add_argument("--html", action="store_true",
+                        help="produce HTML output, subsumes --links and --sections")
+    groupP.add_argument("-l", "--links", action="store_true",
                         help="preserve links")
-    parser.add_argument("-ns", "--namespaces", default="", metavar="ns1,ns2",
+    groupP.add_argument("-ns", "--namespaces", default="", metavar="ns1,ns2",
                         help="accepted namespaces")
-    parser.add_argument("-q", "--quiet", action="store_true",
-                        help="suppress reporting progress info")
-    parser.add_argument("-s", "--sections", action="store_true",
+    groupP.add_argument("-s", "--sections", action="store_true",
                         help="preserve sections")
-    parser.add_argument("-a", "--article", action="store_true",
-                        help="analyze a file containing a single article (debug) option")
-    # parser.add_argument("-f", "--format", choices=(PLAIN, JSON), default=PLAIN,
-    #                     help="choose output format default is %(default)s")
-    parser.add_argument("--templates",
+    groupP.add_argument("--templates",
                         help="use or create file containing templates")
-    parser.add_argument("-v", "--version", action="version",
+    groupP.add_argument("--no-templates", action="store_false",
+                        help="Do not expand templates")
+    parser.add_argument("--threads", type=int, default=2,
+                        help="Number of threads to use (default 2)")
+
+    groupS = parser.add_argument_group('Special')
+    groupS.add_argument("-q", "--quiet", action="store_true",
+                        help="suppress reporting progress info")
+    groupS.add_argument("--debug", action="store_true",
+                        help="print debug info")
+    groupS.add_argument("-a", "--article", action="store_true",
+                        help="analyze a file containing a single article (debug) option")
+    groupS.add_argument("-v", "--version", action="version",
                         version='%(prog)s ' + version,
                         help="print program version")
 
     args = parser.parse_args()
-    
-    keepLinks = args.links
-    keepSections = args.sections
 
-    if args.base:
-        prefix = args.base
+    Extractor.keepLinks = args.links
+    Extractor.keepSections = args.sections
+    Extractor.toHTML = args.html
+    if args.html:
+        Extractor.keepLinks = True
+        Extractor.keepSections = True
+
+    expand_templates = args.no_templates
 
     try:
-        if args.bytes[-1] in 'kK':
-            file_size = int(args.bytes[:-1]) * 1024
-        elif args.bytes[-1] in 'mM':
-            file_size = int(args.bytes[:-1]) * 1024 * 1024
-        else:
-            file_size = int(args.bytes)
+        power = 'kmg'.find(args.bytes[-1].lower()) + 1
+        file_size = int(args.bytes[:-1]) * 1024 ** power 
         if file_size < minFileSize: raise ValueError()
     except ValueError:
-        logging.error('Insufficient or invalid size: %s' % args.bytes)
+        logging.error('Insufficient or invalid size: %s', args.bytes)
         return
 
     if args.namespaces:
         acceptedNamespaces = set(args.ns.split(','))
 
+    FORMAT = '%(levelname)s: %(message)s'
+    logging.basicConfig(format=FORMAT)
+
+    logger = logging.getLogger()
     if not args.quiet:
-        logging.basicConfig(level=logging.INFO)
+        logger.setLevel(logging.INFO)
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
 
     input_file = args.input
 
-    if not keepLinks:
+    if not Extractor.keepLinks:
         ignoreTag('a')
 
     if args.article:
@@ -1684,12 +2431,11 @@ def main():
         with open(input_file) as file:
             page = file.read().decode('utf-8')
             m = re.search(r'<id>(.*)</id>', page)
-            if m:
-                id = m.group(1)
+            id = m.group(1) if m else 0
             m = re.search(r'<title>(.*)</title>', page)
             if m:
                 title = m.group(1)
-            extract(id, title, [page], OutputSplitter())
+            Extractor(id, title, [page]).extract()
         return
 
     output_dir = args.output
@@ -1697,12 +2443,11 @@ def main():
         try:
             os.makedirs(output_dir)
         except:
-            logging.error('Could not create: %s' % output_dir)
+            logging.error('Could not create: %s', output_dir)
             return
 
-    output_splitter = OutputSplitter(output_dir, file_size, args.compress)
-    process_data(input_file, args.templates, output_splitter)
-    output_splitter.close()
+    process_dump(input_file, args.templates, output_dir, file_size,
+                 args.compress, args.threads)
 
 if __name__ == '__main__':
     main()
