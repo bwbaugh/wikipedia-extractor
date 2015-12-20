@@ -1,3 +1,9 @@
+This is a mirror repo for the script by Giuseppe Attardi, and contains history before the official repo started.
+
+Please refer to the official repo if there any issues: https://github.com/attardi/wikiextractor
+
+----
+
 Wikipedia Extractor
 ===================
 
