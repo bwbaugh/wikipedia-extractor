@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # =============================================================================
-#  Version: 2.52 (March 6, 2016)
+#  Version: 2.55 (March 23, 2016)
 #  Author: Giuseppe Attardi (attardi@di.unipi.it), University of Pisa
 #
 #  Contributors:
@@ -42,7 +42,7 @@ Each file will contain several documents in the format:
         ...
         </doc>
 
-This version performs template expansion by preprocesssng the whole dump and
+Template expansion requires preprocesssng first the whole dump and
 collecting template definitions.
 """
 
@@ -66,7 +66,7 @@ from timeit import default_timer
 # ===========================================================================
 
 # Program version
-version = '2.52'
+version = '2.55'
 
 ## PARAMS ####################################################################
 
@@ -403,7 +403,7 @@ class Extractor(object):
     keepLinks = False
 
     ##
-    # Whether to preserve section titles (unused)
+    # Whether to preserve section titles
     keepSections = True
 
     ##
@@ -1029,7 +1029,7 @@ def findMatchingBraces(text, ldelim=0):
                 cur = end
 
 
-def findBalanced(text, openDelim, closeDelim):
+def findBalanced(text, openDelim=['[['], closeDelim=[']]']):
     """
     Assuming that text contains a properly balanced expression using
     :param openDelim: as opening delimiters and
@@ -1707,7 +1707,7 @@ def replaceInternalLinks(text):
     # triple closing ]]].
     cur = 0
     res = ''
-    for s, e in findBalanced(text, ('[['), (']]')):
+    for s, e in findBalanced(text):
         m = tailRE.match(text, e)
         if m:
             trail = m.group(0)
@@ -1725,7 +1725,7 @@ def replaceInternalLinks(text):
             title = inner[:pipe].rstrip()
             # find last |
             curp = pipe + 1
-            for s1, e1 in findBalanced(inner, ('[['), (']]')):
+            for s1, e1 in findBalanced(inner):
                 last = inner.rfind('|', curp, s1)
                 if last >= 0:
                     pipe = last  # advance
@@ -2035,9 +2035,14 @@ wgUrlProtocols = [
 # \p{Zs} is unicode 'separator, space' category. It covers the space 0x20
 # as well as U+3000 is IDEOGRAPHIC SPACE for bug 19052
 EXT_LINK_URL_CLASS = r'[^][<>"\x00-\x20\x7F\s]'
+ANCHOR_CLASS = r'[^][\x00-\x08\x0a-\x1F]'
 ExtLinkBracketedRegex = re.compile(
-    '\[(((?i)' + '|'.join(wgUrlProtocols) + ')' + EXT_LINK_URL_CLASS + r'+)\s*([^\]\x00-\x08\x0a-\x1F]*?)\]',
+    '\[(((?i)' + '|'.join(wgUrlProtocols) + ')' + EXT_LINK_URL_CLASS + r'+)' +
+    r'\s*((?:' + ANCHOR_CLASS + r'|\[\[' + ANCHOR_CLASS + r'+\]\])' + r'*?)\]',
     re.S | re.U)
+# A simpler alternative:
+# ExtLinkBracketedRegex = re.compile(r'\[(.*?)\](?!])')
+
 EXT_IMAGE_REGEX = re.compile(
     r"""^(http://|https://)([^][<>"\x00-\x20\x7F\s]+)
     /([A-Za-z0-9_.,~%\-+&;#*?!=()@\x80-\xFF]+)\.((?i)gif|png|jpg|jpeg)$""",
@@ -2182,12 +2187,18 @@ def compact(text):
             n = line[i - 1]  # last list char
             line = line[i:].strip()
             if line:  # FIXME: n is '"'
-                if Extractor.toHTML:
-                    page.append(listItem[n] % line)
-                elif Extractor.keepLists:
+                if Extractor.keepLists:
+                    # emit open sections
+                    items = headers.items()
+                    items.sort()
+                    for i, v in items:
+                        page.append(v)
+                    headers.clear()
                     # FIXME: use item count for #-lines
                     bullet = '1. ' if n == '#' else '- '
                     page.append('{0:{1}s}'.format(bullet, len(listLevel)) + line)
+                elif Extractor.toHTML:
+                    page.append(listItem[n] % line)
         elif len(listLevel):
             page.append(line)
             if Extractor.toHTML:
@@ -2657,6 +2668,8 @@ def main():
                         help="produce HTML output, subsumes --links")
     groupP.add_argument("-l", "--links", action="store_true",
                         help="preserve links")
+    groupP.add_argument("-s", "--sections", action="store_true",
+                        help="preserve sections")
     groupP.add_argument("--lists", action="store_true",
                         help="preserve lists")
     groupP.add_argument("-ns", "--namespaces", default="", metavar="ns1,ns2",
@@ -2685,6 +2698,7 @@ def main():
     args = parser.parse_args()
 
     Extractor.keepLinks = args.links
+    Extractor.keepSections = args.sections
     Extractor.keepLists = args.lists
     Extractor.toHTML = args.html
     if args.html:
