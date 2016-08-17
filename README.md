@@ -118,8 +118,7 @@ The following commands illustrate how to apply the script to a Wikipedia
 dump:
 
     > wget http://download.wikimedia.org/itwiki/latest/itwiki-latest-pages-articles.xml.bz2
-    > bzcat itwiki-latest-pages-articles.xml.bz2 |
-      WikiExtractor.py -cb 250K -o extracted
+    > bzcat itwiki-latest-pages-articles.xml.bz2 | WikiExtractor.py -cb 250K -o extracted -
 
 In order to combine the whole extracted text into a single file one can
 issue:
